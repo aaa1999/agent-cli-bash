@@ -71,7 +71,8 @@ A_API_KEY=
 # A_MAX_CONTEXT_CHARS=24000  # 会话上下文字符预算
 # A_TIMEOUT=60               # 单次请求超时秒数
 EOF
-    echo "已生成配置模板 ${config_file}（记得填入 A_API_KEY）"
+    chmod 600 "$config_file"
+    echo "已生成配置模板 ${config_file}（权限 600，记得填入 A_API_KEY）"
 fi
 
 cat <<EOF
@@ -79,9 +80,8 @@ cat <<EOF
 安装完成 ✔
 
   1. 重启终端，或先执行:  source $target_rc
-  2. 配置密钥（二选一，运行 a providers 查看支持的提供商）:
-       export A_API_KEY=sk-xxx
-     或编辑 $config_file
+  2. 配置密钥: 运行 a setup 交互式配置
+     （或 export A_API_KEY=sk-xxx / 编辑 ${config_file}）
   3. 试用:  a 找出当前目录下最大的 5 个文件
 
 EOF

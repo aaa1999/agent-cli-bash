@@ -80,6 +80,10 @@ class H(BaseHTTPRequestHandler):
                 cmd = "export A_TEST_VAR=shell_state_ok"
             elif "PROVIDER" in last_user:
                 cmd = "echo PROVIDER_MODEL_OK" if body.get("model") == "kimi-k2-0905-preview" else "echo MODEL_WRONG"
+            elif "PWDCTX" in last_user:
+                want_git = "NOGIT" not in last_user
+                ok = ("当前目录:" in allc) and ("目录内容" in allc) and (("git:" in allc) == want_git)
+                cmd = "echo ENVCTX_OK" if ok else "echo ENVCTX_MISSING"
             elif "TRIM0" in last_user:
                 cmd = "echo PAD_OLD_" + "P" * 300
             elif "TRIM1" in last_user:
@@ -241,7 +245,59 @@ rc=0
 out=$(env -u DEEPSEEK_API_KEY -u A_MAX_RETRIES A_CONFIG_FILE="$cfg" \
     zsh -c "source '$REPO_DIR/a.sh'; a -p 'RATELIMIT 请求'" 2>&1) || rc=$?
 check "config 文件中 A_MAX_RETRIES=0 禁用重试" "$rc - $(printf '%s' "$out" | grep -c '已自动重试')" "1 - 0"
+
+chmod 644 "$cfg"
+env -u DEEPSEEK_API_KEY -u A_MAX_RETRIES A_CONFIG_FILE="$cfg" \
+    zsh -c "source '$REPO_DIR/a.sh'; a -p '随便'" >/dev/null 2>&1
+check "加载时自动收紧配置权限为 600" "$(ls -l "$cfg" | awk '{print $1}' | sed 's/[@+]$//')" "-rw-------"
 rm -f "$cfg"
+
+echo "== 3.7 环境上下文 =="
+out=$(cd "$REPO_DIR" && env DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL" \
+    zsh -c "source '$REPO_DIR/a.sh'; a -p 'PWDCTX 请求'" 2>/dev/null)
+check "携带当前目录/git 状态/目录条目" "$out" "echo ENVCTX_OK"
+
+tmpd=$(mktemp -d)
+touch "$tmpd/a-file.txt"
+out=$(cd "$tmpd" && env DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL" \
+    zsh -c "source '$REPO_DIR/a.sh'; a -p 'PWDCTX NOGIT 请求'" 2>/dev/null)
+check "非 git 目录不携带 git 行" "$out" "echo ENVCTX_OK"
+rm -rf "$tmpd"
+
+echo "== 3.8 a setup 配置向导 =="
+mask=$(zsh -c "source '$REPO_DIR/a.sh'; _a_mask_key sk-abcdefgh1234" 2>/dev/null)
+check "密钥掩码保留首尾" "$mask" "sk-a***1234"
+mask=$(zsh -c "source '$REPO_DIR/a.sh'; _a_mask_key short" 2>/dev/null)
+check "短密钥全遮" "$mask" "***"
+
+cfgm=$(mktemp "${TMPDIR:-/tmp}/a-setup.XXXXXX")
+printf '# 注释行\nA_PROVIDER=deepseek\nA_MAX_RETRIES=5\n' > "$cfgm"
+zsh -c "source '$REPO_DIR/a.sh'; A_CONFIG_FILE='$cfgm' _a_config_merge A_PROVIDER=kimi A_API_KEY=sk-xyz9876543210" >/dev/null 2>&1
+check "merge 原位替换提供商" "$(grep '^A_PROVIDER=' "$cfgm")" "A_PROVIDER=kimi"
+check "merge 追加密钥" "$(grep '^A_API_KEY=' "$cfgm")" "A_API_KEY=sk-xyz9876543210"
+check "merge 保留其他配置" "$(grep '^A_MAX_RETRIES=' "$cfgm")" "A_MAX_RETRIES=5"
+grep -q '^# 注释行' "$cfgm" && ok "merge 保留注释" || fail "merge 保留注释"
+check "merge 后权限 600" "$(ls -l "$cfgm" | awk '{print $1}' | sed 's/[@+]$//')" "-rw-------"
+rm -f "$cfgm"
+
+if command -v expect >/dev/null 2>&1; then
+    tmpd2=$(mktemp -d "${TMPDIR:-/tmp}/a-setup.XXXXXX")
+    cfgw=$tmpd2/config
+    A_TEST_CMD="source '$REPO_DIR/a.sh'; A_CONFIG_FILE='$cfgw' a setup" expect -c '
+        set timeout 8
+        spawn zsh -c $env(A_TEST_CMD)
+        expect "选择提供商"
+        send "2\r"
+        expect "粘贴 API 密钥"
+        send "sk-setup-111122223333\r"
+        expect "已写入"
+        expect eof
+    ' >/dev/null 2>&1
+    check "向导写入提供商(openai)" "$(grep '^A_PROVIDER=' "$cfgw" 2>/dev/null)" "A_PROVIDER=openai"
+    check "向导写入密钥" "$(grep '^A_API_KEY=' "$cfgw" 2>/dev/null)" "A_API_KEY=sk-setup-111122223333"
+    check "向导后权限 600" "$(ls -l "$cfgw" 2>/dev/null | awk '{print $1}' | sed 's/[@+]$//')" "-rw-------"
+    rm -rf "$tmpd2"
+fi
 
 echo "== 4. 错误路径 =="
 rc=0
@@ -368,6 +424,7 @@ n=$(grep -c ">>> agent-cli-bash >>>" "$TMPHOME/.zshrc")
 check "重复安装幂等（只有一块）" "$n" "1"
 grep -q "A_PROVIDER=" "$TMPHOME/.config/agent-cli-bash/config" \
     && ok "生成配置模板" || fail "生成配置模板"
+check "配置模板权限 600" "$(ls -l "$TMPHOME/.config/agent-cli-bash/config" | awk '{print $1}' | sed 's/[@+]$//')" "-rw-------"
 (
     cd "$REPO_DIR"
     HOME="$TMPHOME" SHELL=/bin/zsh bash install.sh --uninstall >/dev/null
