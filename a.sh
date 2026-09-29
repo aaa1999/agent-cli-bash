@@ -105,17 +105,86 @@ _a_clean() {
     printf '%s' "$1" | sed -e '/^```/d' -e 's/^```[a-zA-Z0-9_-]*//' -e 's/```$//' | awk 'NF'
 }
 
-# 追加一条 JSON 消息到本会话对话（全局变量 _A_CONV，每行一条消息），上限 40 条
+# 追加一条消息到本会话对话（全局变量 _A_CONV，每行一条，格式: 类型<TAB>JSON）。
+# 类型: Q=用户请求 A=AI命令 R=执行结果，三者构成一轮，供裁剪时保持轮次完整。
 _a_conv_append() {
     if [[ -n ${_A_CONV:-} ]]; then
         _A_CONV="$_A_CONV
-$1"
+$1"$'\t'"$2"
     else
-        _A_CONV="$1"
+        _A_CONV="$1"$'\t'"$2"
     fi
+    # 上限 40 条消息（约 13 轮），超出丢最早的
     if [[ $(printf '%s\n' "$_A_CONV" | wc -l) -gt 40 ]]; then
         _A_CONV=$(printf '%s\n' "$_A_CONV" | tail -n 40)
     fi
+}
+
+# 按字符预算从新到旧保留完整的轮(Q 行开新轮)，孤立的 A/R 头部一并丢弃；
+# 至少保留最新一轮。预算由 A_MAX_CONTEXT_CHARS 控制（默认 24000 字节，约 12K token）
+_a_conv_trim() {
+    # 注意: 用 NR 做下标——macOS awk 中未初始化变量作下标是空串而非 0
+    awk -v budget="${A_MAX_CONTEXT_CHARS:-24000}" '
+        { types[NR] = substr($0, 1, 1); lens[NR] = length($0) + 1; lines[NR] = $0 }
+        END {
+            n = NR; total = 0; start = n + 1
+            for (i = n; i >= 1; i--) {
+                if (types[i] != "Q") continue
+                rl = 0
+                for (j = i; j < start; j++) rl += lens[j]
+                if (total + rl > budget && start <= n) break
+                total += rl; start = i
+            }
+            for (i = start; i <= n; i++) print lines[i]
+        }
+    '
+}
+
+# 从 stdin 的单条消息 JSON 中取 content（--show 摘要用）
+_a_msg_content() {
+    if command -v jq >/dev/null 2>&1; then
+        jq -r '.content // empty' 2>/dev/null
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json, sys
+try:
+    sys.stdout.write(json.load(sys.stdin).get("content") or "")
+except Exception:
+    pass' 2>/dev/null
+    fi
+}
+
+# 查看当前会话的上下文构成
+_a_show() {
+    if [[ -z ${_A_CONV:-} ]]; then
+        printf '（当前会话暂无对话上下文）\n'
+        return 0
+    fi
+    local budget=${A_MAX_CONTEXT_CHARS:-24000}
+    local total all_n kept_n kept_chars
+    total=$(printf '%s' "$_A_CONV" | wc -c | tr -d ' ')
+    all_n=$(printf '%s\n' "$_A_CONV" | wc -l | tr -d ' ')
+    kept=$(printf '%s\n' "$_A_CONV" | _a_conv_trim)
+    kept_n=$(printf '%s\n' "$kept" | wc -l | tr -d ' ')
+    kept_chars=$(printf '%s' "$kept" | wc -c | tr -d ' ')
+    printf '会话上下文: %d 条消息 / %d 字节，预算 %d，下一轮将发送 %d 条 / %d 字节（a -c 清空）\n' \
+        "$all_n" "$total" "$budget" "$kept_n" "$kept_chars"
+    local round=0 c
+    printf '%s\n' "$kept" | while IFS=$'\t' read -r typ json; do
+        c=$(printf '%s' "$json" | _a_msg_content 2>/dev/null)
+        case $typ in
+            Q)
+                round=$((round + 1))
+                printf '  轮 %d  %s\n' "$round" "$(printf '%s\n' "$c" | tail -n 1 | sed 's/^请求: //' | cut -c 1-70)"
+                ;;
+            A)
+                printf '        命令: %s\n' "$(printf '%s\n' "$c" | head -n 1 | cut -c 1-70)$(printf '%s\n' "$c" | awk 'END{if(NR>1)printf " (+%d 行)", NR-1}')"
+                ;;
+            R)
+                printf '        结果: %s\n' "$(printf '%s\n' "$c" | head -n 1 | cut -c 1-70)"
+                ;;
+        esac
+    done
 }
 
 # 判断命令是否直接改变当前 shell 状态（cd/export/alias/source/赋值等）。
@@ -170,6 +239,7 @@ a —— 自然语言转 bash 命令（agent-cli-bash）
   a -p <自然语言>    只打印命令，不执行
   a -y <自然语言>    生成后直接执行，不询问（谨慎使用）
   a -c               清空本会话的多轮对话上下文
+  a --show           查看当前会话的上下文构成（轮次/体积/裁剪情况）
   a -h | --help      显示帮助
   a --version        显示版本
 
@@ -194,6 +264,8 @@ a —— 自然语言转 bash 命令（agent-cli-bash）
   DEEPSEEK_API_KEY   DeepSeek API 密钥（https://platform.deepseek.com/api_keys）
   DEEPSEEK_BASE_URL  API 地址，默认 https://api.deepseek.com
   DEEPSEEK_MODEL     模型，默认 deepseek-chat
+  A_MAX_RETRIES      网络错误/429/5xx 自动重试次数，默认 3（0=禁用），指数退避
+  A_MAX_CONTEXT_CHARS 会话上下文字符预算，默认 24000（约 12K token），超出裁掉最旧的轮次
 
 示例:
   a 找出当前目录下最大的 5 个文件
@@ -224,6 +296,7 @@ a() {
                 case $OPTARG in
                     help)    _a_help; return 0 ;;
                     version) printf 'agent-cli-bash %s\n' "$A_VERSION"; return 0 ;;
+                    show)    _a_show; return 0 ;;
                     clear)   _A_CONV=''; printf '已清空本会话的对话上下文\n' >&2; return 0 ;;
                     *) _a_err "未知选项 --$OPTARG（try: a -h）"; return 2 ;;
                 esac
@@ -294,55 +367,94 @@ $hist
 
     msgs_json="$sys_json,$user_json"
     if [[ -n ${_A_CONV:-} ]]; then
-        msgs_json="$sys_json,$(printf '%s\n' "$_A_CONV" | tail -n 20 | paste -sd ',' -),$user_json"
+        msgs_json="$sys_json,$(printf '%s\n' "$_A_CONV" | _a_conv_trim | cut -f2- | paste -sd ',' -),$user_json"
     fi
 
     local payload
     payload=$(printf '{"model":"%s","messages":[%s],"temperature":0,"max_tokens":512,"stream":true}' \
         "$(_a_json_escape "$model")" "$msgs_json")
 
-    # 流式请求（SSE）：AI 生成的内容实时显示；增量与异常分别落盘，循环外汇总
+    # 流式请求（SSE）：AI 生成的内容实时显示；增量与异常分别落盘，循环外汇总。
+    # 网络错误与 HTTP 429/5xx 自动重试（指数退避，优先遵循 Retry-After），
+    # 重试次数由 A_MAX_RETRIES 控制（默认 3，0 = 禁用）。
     printf '🤖 思考中...\r' >&2
-    local raw_file content_file err_file curl_rc=0 content
+    local raw_file content_file err_file hdr_file curl_rc=0 content http_code=
     raw_file=$(mktemp "${TMPDIR:-/tmp}/a-raw.XXXXXX")
     content_file=$(mktemp "${TMPDIR:-/tmp}/a-cc.XXXXXX")
     err_file=$(mktemp "${TMPDIR:-/tmp}/a-err.XXXXXX")
+    hdr_file=$(mktemp "${TMPDIR:-/tmp}/a-hdr.XXXXXX")
 
-    curl -sS -N --max-time "$timeout" \
-        -H 'Content-Type: application/json' \
-        -H "Authorization: Bearer $api_key" \
-        -d "$payload" \
-        "$base_url/chat/completions" 2>"$err_file" | tee "$raw_file" | {
-        local line data delta shown=0
-        while IFS= read -r line; do
-            if [[ $line == data:* ]]; then
-                data=${line#data: }
-                [[ $data == '[DONE]' ]] && break
-                # x 占位保留输出，再剥掉哨兵换行：内容内部的换行不丢、也不多出换行
-                delta=$(printf '%s' "$data" | _a_json_delta; printf x)
-                delta=${delta%x}
-                delta=${delta%$'\n'}
-                if [[ -n $delta ]]; then
-                    if [[ $shown == 0 ]]; then
-                        printf '\r\033[K\033[2m' >&2
-                        shown=1
+    local attempt=0 max_retries=${A_MAX_RETRIES:-3} backoff=1 retry= reason= ra=
+    # 注意: zsh 中管道最后一段在当前 shell 执行，声明必须放在循环外并带初值，
+    # 否则重试轮的重复 local 会触发 zsh 对已存在变量的"打印"行为
+    local sse_line='' sse_data='' sse_delta='' sse_shown=0
+    while :; do
+        : > "$raw_file"; : > "$content_file"; : > "$err_file"; : > "$hdr_file"
+        curl -sS -N --max-time "$timeout" -D "$hdr_file" \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer $api_key" \
+            -d "$payload" \
+            "$base_url/chat/completions" 2>"$err_file" | tee "$raw_file" | {
+            sse_line=''; sse_data=''; sse_delta=''; sse_shown=0
+            while IFS= read -r sse_line; do
+                if [[ $sse_line == data:* ]]; then
+                    sse_data=${sse_line#data: }
+                    [[ $sse_data == '[DONE]' ]] && break
+                    # x 占位保留输出，再剥掉哨兵换行：内容内部的换行不丢、也不多出换行
+                    sse_delta=$(printf '%s' "$sse_data" | _a_json_delta; printf x)
+                    sse_delta=${sse_delta%x}
+                    sse_delta=${sse_delta%$'\n'}
+                    if [[ -n $sse_delta ]]; then
+                        if [[ $sse_shown == 0 ]]; then
+                            printf '\r\033[K\033[2m' >&2
+                            sse_shown=1
+                        fi
+                        printf '%s' "$sse_delta" >&2
+                        printf '%s' "$sse_delta" >> "$content_file"
                     fi
-                    printf '%s' "$delta" >&2
-                    printf '%s' "$delta" >> "$content_file"
+                else
+                    [[ -n $sse_line ]] && printf '%s\n' "$sse_line" >> "$err_file"
                 fi
-            else
-                [[ -n $line ]] && printf '%s\n' "$line" >> "$err_file"
-            fi
-        done
-    }
-    curl_rc=${PIPESTATUS[0]:-${pipestatus[1]:-0}}
-    printf '\033[0m\n' >&2
+            done
+        }
+        curl_rc=${PIPESTATUS[0]:-${pipestatus[1]:-0}}
+        printf '\033[0m\n' >&2
+        content=$(cat "$content_file" 2>/dev/null)
+        http_code=$(awk 'NR==1{print $2; exit}' "$hdr_file" 2>/dev/null)
 
-    content=$(cat "$content_file" 2>/dev/null)
+        retry=; reason=
+        if [[ -z $content ]]; then
+            if [[ $curl_rc -ne 0 ]]; then
+                # 可重试的网络类退出码（DNS/连接/超时/SSL/重置等）；中断类不重试
+                case $curl_rc in
+                    6|7|16|18|23|26|28|35|52|55|56) retry=1; reason="网络错误 (curl $curl_rc)" ;;
+                esac
+            else
+                case $http_code in
+                    429) retry=1; reason="HTTP 429 限流" ;;
+                    5??) retry=1; reason="HTTP $http_code 服务端错误" ;;
+                esac
+            fi
+        fi
+
+        [[ $retry != 1 ]] && break
+        attempt=$((attempt + 1))
+        if [[ $attempt -gt $max_retries ]]; then
+            attempt=$((attempt - 1))
+            break
+        fi
+        ra=$(awk 'tolower($1)=="retry-after:"{print $2; exit}' "$hdr_file" 2>/dev/null)
+        [[ -n $ra ]] || ra=$backoff
+        printf '\r\033[K⏳ %s，%s 秒后重试 (%d/%d)\n' "$reason" "$ra" "$attempt" "$max_retries" >&2
+        sleep "$ra"
+        backoff=$((backoff * 2))
+        printf '🤖 重试中...\r' >&2
+    done
 
     if [[ -z $content ]]; then
         # 流式失败：优先按错误 JSON 解析（如 401），其次尝试整包解析（网关忽略 stream 参数时）
         printf '\r\033[K' >&2
+        [[ $attempt -gt 0 ]] && printf '⏳ 已自动重试 %d 次仍失败\n' "$attempt" >&2
         local errout emsg
         errout=$(cat "$err_file" "$raw_file" 2>/dev/null | head -c 2000)
         content=$(printf '%s' "$errout" | _a_json_content)
@@ -352,14 +464,16 @@ $hist
                 _a_err "API 错误: $emsg"
             elif [[ $curl_rc -ne 0 ]]; then
                 _a_err "请求失败 (curl 退出码 $curl_rc): $(head -c 300 "$err_file")"
+            elif [[ $http_code == 429 || $http_code == 5* ]]; then
+                _a_err "API 错误 (HTTP $http_code): ${errout:0:300}"
             else
                 _a_err "无法解析响应: ${errout:0:300}"
             fi
-            rm -f "$raw_file" "$content_file" "$err_file"
+            rm -f "$raw_file" "$content_file" "$err_file" "$hdr_file"
             return 1
         fi
     fi
-    rm -f "$raw_file" "$content_file" "$err_file"
+    rm -f "$raw_file" "$content_file" "$err_file" "$hdr_file"
 
     local cmd
     cmd=$(_a_clean "$content")
@@ -369,8 +483,8 @@ $hist
     fi
 
     # 记入本会话对话：本次请求 + AI 给出的命令（未执行也记录，便于下一轮追问）
-    _a_conv_append "$user_json"
-    _a_conv_append "$(printf '{"role":"assistant","content":"%s"}' "$(_a_json_escape "$cmd")")"
+    _a_conv_append Q "$user_json"
+    _a_conv_append A "$(printf '{"role":"assistant","content":"%s"}' "$(_a_json_escape "$cmd")")"
 
     if [[ $print_only == 1 ]]; then
         printf '%s\n' "$cmd"
@@ -485,7 +599,7 @@ $hist
     if [[ $state_executed -gt 0 ]]; then
         summary="$summary（其中 $state_executed 步为 shell 状态命令 cd/变量等，已在当前 shell 生效，输出未捕获）"
     fi
-    _a_conv_append "$(printf '{"role":"user","content":"%s"}' "$(_a_json_escape "$summary
+    _a_conv_append R "$(printf '{"role":"user","content":"%s"}' "$(_a_json_escape "$summary
 输出(可能截断):
 $out_tail")")"
     return $rc

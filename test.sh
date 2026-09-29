@@ -30,6 +30,7 @@ import json, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1])
+retry_state = {"count": 0}
 
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -42,7 +43,26 @@ class H(BaseHTTPRequestHandler):
         if "BADKEY" in auth or "AUTHFAIL" in last_user:
             code, obj = 401, {"error": {"message": "Authentication Fails (no such user)"}}
         else:
-            if "MOCK_ECHO_CWD" in last_user:
+            if "RATELIMIT" in last_user:
+                self.send_response(429)
+                self.send_header("retry-after", "1")
+                self.send_header("content-type", "application/json")
+                data = json.dumps({"error": {"message": "Insufficient Balance"}}).encode()
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            elif "RETRYME" in last_user:
+                retry_state["count"] += 1
+                if retry_state["count"] == 1:
+                    self.send_response(503)
+                    self.send_header("content-type", "text/plain")
+                    self.send_header("content-length", "13")
+                    self.end_headers()
+                    self.wfile.write(b"temp unavail")
+                    return
+                cmd = "echo RETRY_OK"
+            elif "MOCK_ECHO_CWD" in last_user:
                 cmd = "echo CWD_WAS_SENT"
             elif "RC7" in last_user:
                 cmd = "(exit 7)"
@@ -58,6 +78,13 @@ class H(BaseHTTPRequestHandler):
                 cmd = "cd /tmp"
             elif "VARTEST" in last_user:
                 cmd = "export A_TEST_VAR=shell_state_ok"
+            elif "TRIM0" in last_user:
+                cmd = "echo PAD_OLD_" + "P" * 300
+            elif "TRIM1" in last_user:
+                cmd = "echo PAD_MID_" + "M" * 300
+            elif "TRIM2" in last_user:
+                # 判断第一轮的"请求"消息是否还在上下文里（命令文本会经 shell 历史回流，不可作判据）
+                cmd = "echo CTX_NOT_TRIMMED" if "TRIM0 请求" in allc else "echo CTX_TRIMMED_OK"
             elif "FEEDBACK1" in last_user:
                 cmd = "echo HELLO_FE"
             elif "FEEDBACK2" in last_user:
@@ -133,6 +160,44 @@ check "zsh: export 变量生效" "$out" "shell_state_ok"
 
 out=$(run_a bash "-y 'VARTEST'; "'echo $A_TEST_VAR')
 check "bash: export 变量生效" "$out" "shell_state_ok"
+
+echo "== 3.3 自动重试 =="
+out=$(run_a zsh "-p 'RETRYME 请求'")
+check "503 后自动重试成功" "$out" "echo RETRY_OK"
+
+rc=0
+out=$(env DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL" A_MAX_RETRIES=1 \
+    zsh -c "source '$REPO_DIR/a.sh'; a -p 'RATELIMIT 请求'" 2>&1) || rc=$?
+check "429 重试耗尽后报错" "$rc - $(printf '%s' "$out" | grep -c '已自动重试 1 次')" "1 - 1"
+if printf '%s' "$out" | grep -q 'Insufficient Balance'; then
+    ok "重试耗尽保留原始错误详情"
+else
+    fail "重试耗尽保留原始错误详情"
+fi
+
+rc=0
+out=$(env DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL" A_MAX_RETRIES=0 \
+    zsh -c "source '$REPO_DIR/a.sh'; a -p 'RATELIMIT 请求'" 2>&1) || rc=$?
+check "A_MAX_RETRIES=0 禁用重试" "$rc - $(printf '%s' "$out" | grep -c '已自动重试')" "1 - 0"
+
+echo "== 3.4 上下文管理 =="
+out=$(env DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL" A_MAX_CONTEXT_CHARS=300 \
+    zsh -c "source '$REPO_DIR/a.sh'; a -y 'TRIM0 请求' >/dev/null 2>&1; a -y 'TRIM1 请求' >/dev/null 2>&1; a -p 'TRIM2 请求'" 2>/dev/null)
+if printf '%s' "$out" | grep -q CTX_TRIMMED_OK; then
+    ok "超预算时裁掉最旧的轮"
+else
+    fail "超预算时裁掉最旧的轮 (实际: $out)"
+fi
+
+out=$(run_a zsh "-p 'SHOW1 请求'; a --show")
+if printf '%s' "$out" | grep -q '轮 1.*SHOW1' && printf '%s' "$out" | grep -q '下一轮将发送'; then
+    ok "--show 展示轮次与体积"
+else
+    fail "--show 展示轮次与体积 (实际: $out)"
+fi
+
+out=$(printf '' | run_a zsh "--show")
+check "--show 空上下文提示" "$out" "（当前会话暂无对话上下文）"
 
 echo "== 4. 错误路径 =="
 rc=0
