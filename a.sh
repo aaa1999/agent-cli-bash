@@ -10,9 +10,33 @@
 #       以及最近的终端历史会自动作为上下文发给 AI，支持"报错了帮我修"等追问。
 #
 # 兼容 bash 与 zsh。配置读取顺序: 环境变量 > ~/.config/agent-cli-bash/config
-# 支持 DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL
+# 支持 A_PROVIDER / A_API_KEY / A_BASE_URL / A_MODEL（`a providers` 查看内置提供商）
+# 旧版 DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL 仍然兼容
 
-A_VERSION="0.1.0"
+A_VERSION="0.2.0"
+
+# 内置提供商: 名称|默认 base URL|默认模型|API key 环境变量
+# 只要是 OpenAI /chat/completions 兼容的网关都能用 A_BASE_URL + A_MODEL 接入
+_A_PROVIDERS='
+deepseek|https://api.deepseek.com|deepseek-chat|DEEPSEEK_API_KEY
+openai|https://api.openai.com/v1|gpt-4o-mini|OPENAI_API_KEY
+kimi|https://api.moonshot.cn/v1|kimi-k2-0905-preview|MOONSHOT_API_KEY
+qwen|https://dashscope.aliyuncs.com/compatible-mode/v1|qwen-plus|DASHSCOPE_API_KEY
+zhipu|https://open.bigmodel.cn/api/paas/v4|glm-4-flash|ZHIPU_API_KEY
+grok|https://api.x.ai/v1|grok-3-mini|XAI_API_KEY
+ollama|http://localhost:11434/v1|qwen3:8b|OLLAMA_API_KEY
+openrouter|https://openrouter.ai/api/v1|openai/gpt-4o-mini|OPENROUTER_API_KEY
+'
+
+# 取提供商表字段: _a_provider_field <name> <字段号 2=URL 3=模型 4=key变量>
+_a_provider_field() {
+    printf '%s\n' "$_A_PROVIDERS" | awk -F'|' -v p="$1" -v f="$2" '$1 == p { print $f; exit }'
+}
+
+_a_list_providers() {
+    printf '%-11s %-50s %-22s %s\n' "PROVIDER" "DEFAULT BASE URL" "DEFAULT MODEL" "KEY ENV"
+    printf '%s\n' "$_A_PROVIDERS" | awk -F'|' 'NF > 1 { printf "%-11s %-50s %-22s %s\n", $1, $2, $3, $4 }'
+}
 
 # ---------- 内部工具 ----------
 
@@ -29,6 +53,13 @@ _a_load_config() {
             \"*\") val=${val#\"}; val=${val%\"} ;;
         esac
         case $key in
+            A_PROVIDER) [[ -n ${A_PROVIDER:-} ]] || A_PROVIDER=$val ;;
+            A_API_KEY)  [[ -n ${A_API_KEY:-}  ]] || A_API_KEY=$val ;;
+            A_BASE_URL) [[ -n ${A_BASE_URL:-} ]] || A_BASE_URL=$val ;;
+            A_MODEL)    [[ -n ${A_MODEL:-}    ]] || A_MODEL=$val ;;
+            A_MAX_RETRIES)       [[ -n ${A_MAX_RETRIES:-}       ]] || A_MAX_RETRIES=$val ;;
+            A_MAX_CONTEXT_CHARS) [[ -n ${A_MAX_CONTEXT_CHARS:-} ]] || A_MAX_CONTEXT_CHARS=$val ;;
+            A_TIMEOUT)           [[ -n ${A_TIMEOUT:-}           ]] || A_TIMEOUT=$val ;;
             DEEPSEEK_API_KEY)  [[ -n ${DEEPSEEK_API_KEY:-}  ]] || DEEPSEEK_API_KEY=$val ;;
             DEEPSEEK_BASE_URL) [[ -n ${DEEPSEEK_BASE_URL:-} ]] || DEEPSEEK_BASE_URL=$val ;;
             DEEPSEEK_MODEL)    [[ -n ${DEEPSEEK_MODEL:-}    ]] || DEEPSEEK_MODEL=$val ;;
@@ -242,6 +273,7 @@ a —— 自然语言转 bash 命令（agent-cli-bash）
   a --show           查看当前会话的上下文构成（轮次/体积/裁剪情况）
   a -h | --help      显示帮助
   a --version        显示版本
+  a providers        列出内置模型提供商
 
 确认时: y=执行  n=不执行(退出码130)  i=忽略(退出码0)  直接回车等同 n
 
@@ -261,11 +293,14 @@ a —— 自然语言转 bash 命令（agent-cli-bash）
   a -c 可随时清空上下文重新开始。
 
 配置（环境变量或 ~/.config/agent-cli-bash/config）:
-  DEEPSEEK_API_KEY   DeepSeek API 密钥（https://platform.deepseek.com/api_keys）
-  DEEPSEEK_BASE_URL  API 地址，默认 https://api.deepseek.com
-  DEEPSEEK_MODEL     模型，默认 deepseek-chat
+  A_PROVIDER         提供商: deepseek(默认) openai kimi qwen zhipu grok ollama openrouter
+  A_API_KEY          API 密钥；未设时自动读取提供商对应变量（如 OPENAI_API_KEY）
+  A_BASE_URL         覆盖 API 地址；A_PROVIDER=custom 时必填
+  A_MODEL            覆盖模型名
+  兼容: 只配 DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL 时行为与旧版一致
   A_MAX_RETRIES      网络错误/429/5xx 自动重试次数，默认 3（0=禁用），指数退避
   A_MAX_CONTEXT_CHARS 会话上下文字符预算，默认 24000（约 12K token），超出裁掉最旧的轮次
+  A_TIMEOUT          单次 API 请求超时秒数，默认 60
 
 示例:
   a 找出当前目录下最大的 5 个文件
@@ -294,9 +329,10 @@ a() {
             h) _a_help; return 0 ;;
             -)
                 case $OPTARG in
-                    help)    _a_help; return 0 ;;
-                    version) printf 'agent-cli-bash %s\n' "$A_VERSION"; return 0 ;;
-                    show)    _a_show; return 0 ;;
+                    help)     _a_help; return 0 ;;
+                    version)  printf 'agent-cli-bash %s\n' "$A_VERSION"; return 0 ;;
+                    providers) _a_list_providers; return 0 ;;
+                    show)     _a_show; return 0 ;;
                     clear)   _A_CONV=''; printf '已清空本会话的对话上下文\n' >&2; return 0 ;;
                     *) _a_err "未知选项 --$OPTARG（try: a -h）"; return 2 ;;
                 esac
@@ -305,6 +341,12 @@ a() {
         esac
     done
     shift $((OPTIND - 1))
+
+    # 子命令形式: a providers
+    if [[ ${1:-} == providers ]]; then
+        _a_list_providers
+        return 0
+    fi
 
     # 管道输入: cat error.log | a 解释这个报错
     # stdin 非终端时读取内容作为上下文（限 8KB）；此后交互确认改从 /dev/tty 读取
@@ -321,15 +363,44 @@ a() {
     [[ -z $query ]] && query="分析以上管道输入，给出下一步需要执行的 bash 命令"
     _a_load_config
 
-    local api_key=${DEEPSEEK_API_KEY:-}
-    local base_url=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
-    local model=${DEEPSEEK_MODEL:-deepseek-chat}
+    # 提供商解析: A_* 显式配置 > 提供商默认 > 旧 DEEPSEEK_*（仅 deepseek，向后兼容）
+    local provider=${A_PROVIDER:-deepseek}
+    local base_url model api_key=
+    local pbase pmodel kenv
+    pbase=$(_a_provider_field "$provider" 2)
+    pmodel=$(_a_provider_field "$provider" 3)
+    kenv=$(_a_provider_field "$provider" 4)
+    if [[ $provider == deepseek ]]; then
+        base_url=${A_BASE_URL:-${DEEPSEEK_BASE_URL:-$pbase}}
+        model=${A_MODEL:-${DEEPSEEK_MODEL:-$pmodel}}
+    else
+        base_url=${A_BASE_URL:-$pbase}
+        model=${A_MODEL:-$pmodel}
+    fi
+    api_key=${A_API_KEY:-}
+    if [[ -z $api_key && -n $kenv ]]; then
+        # 读取提供商对应的环境变量（如 OPENAI_API_KEY / MOONSHOT_API_KEY）
+        if [[ -n ${ZSH_VERSION:-} ]]; then
+            api_key=${(P)kenv}
+        else
+            api_key=${!kenv}
+        fi
+    fi
+    [[ -z $api_key ]] && api_key=${DEEPSEEK_API_KEY:-}
     local timeout=${A_TIMEOUT:-60}
 
-    if [[ -z $api_key ]]; then
-        _a_err "未配置 DEEPSEEK_API_KEY"
-        printf '  1) 在 https://platform.deepseek.com/api_keys 创建密钥\n' >&2
-        printf '  2) export DEEPSEEK_API_KEY=sk-xxx  或写入 ~/.config/agent-cli-bash/config\n' >&2
+    if [[ -z $base_url ]]; then
+        _a_err "未知提供商 '$provider'"
+        printf '  支持: deepseek openai kimi qwen zhipu grok ollama openrouter（a providers 查看）\n' >&2
+        printf '  其他 OpenAI 兼容网关: 设 A_PROVIDER=custom 并配 A_BASE_URL + A_MODEL\n' >&2
+        return 1
+    fi
+
+    # ollama 本地服务无需密钥，其余提供商必须配置
+    if [[ -z $api_key && $provider != ollama ]]; then
+        _a_err "未配置 API 密钥"
+        printf '  1) export A_API_KEY=sk-xxx 或 %s\n' "${kenv:-DEEPSEEK_API_KEY}" >&2
+        printf '  2) 或写入 ~/.config/agent-cli-bash/config（A_API_KEY=sk-xxx）\n' >&2
         return 1
     fi
     command -v curl >/dev/null 2>&1 || { _a_err "需要 curl"; return 1; }

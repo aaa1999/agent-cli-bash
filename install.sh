@@ -59,13 +59,19 @@ config_file=$config_dir/config
 if [[ ! -f $config_file ]]; then
     mkdir -p "$config_dir"
     cat > "$config_file" <<'EOF'
-# agent-cli-bash 配置。也可用环境变量覆盖同名项。
-# 在 https://platform.deepseek.com/api_keys 创建密钥后填到下面，或 export DEEPSEEK_API_KEY=sk-xxx
-DEEPSEEK_API_KEY=
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-chat
+# agent-cli-bash 配置。也可用环境变量覆盖同名项（运行 `a providers` 查看内置提供商）
+# 提供商: deepseek(默认) openai kimi qwen zhipu grok ollama openrouter
+A_PROVIDER=deepseek
+# 密钥填这里（也可 export A_API_KEY=sk-xxx，或用提供商变量如 OPENAI_API_KEY）
+A_API_KEY=
+# 以下可选，留空用提供商默认
+# A_BASE_URL=
+# A_MODEL=
+# A_MAX_RETRIES=3            # 网络错误/429/5xx 自动重试次数（0=禁用）
+# A_MAX_CONTEXT_CHARS=24000  # 会话上下文字符预算
+# A_TIMEOUT=60               # 单次请求超时秒数
 EOF
-    echo "已生成配置模板 ${config_file}（记得填入 DEEPSEEK_API_KEY）"
+    echo "已生成配置模板 ${config_file}（记得填入 A_API_KEY）"
 fi
 
 cat <<EOF
@@ -73,8 +79,8 @@ cat <<EOF
 安装完成 ✔
 
   1. 重启终端，或先执行:  source $target_rc
-  2. 配置密钥（二选一）:
-       export DEEPSEEK_API_KEY=sk-xxx
+  2. 配置密钥（二选一，运行 a providers 查看支持的提供商）:
+       export A_API_KEY=sk-xxx
      或编辑 $config_file
   3. 试用:  a 找出当前目录下最大的 5 个文件
 

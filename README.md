@@ -26,21 +26,39 @@ source ~/.zshrc       # 或重启终端
 
 ## 配置
 
-在 https://platform.deepseek.com/api_keys 创建 API 密钥，然后二选一：
+支持多家模型提供商，`a providers` 查看内置列表：
+
+| 提供商 | `A_PROVIDER` | 默认模型 | 密钥环境变量 |
+| --- | --- | --- | --- |
+| DeepSeek（默认） | `deepseek` | `deepseek-chat` | `DEEPSEEK_API_KEY` |
+| ChatGPT / OpenAI | `openai` | `gpt-4o-mini` | `OPENAI_API_KEY` |
+| Kimi / Moonshot | `kimi` | `kimi-k2-0905-preview` | `MOONSHOT_API_KEY` |
+| 通义千问 | `qwen` | `qwen-plus` | `DASHSCOPE_API_KEY` |
+| 智谱 GLM | `zhipu` | `glm-4-flash` | `ZHIPU_API_KEY` |
+| xAI Grok | `grok` | `grok-3-mini` | `XAI_API_KEY` |
+| Ollama（本地） | `ollama` | `qwen3:8b` | 无需（默认空） |
+| OpenRouter | `openrouter` | `openai/gpt-4o-mini` | `OPENROUTER_API_KEY` |
+
+切换到 ChatGPT 只需：
 
 ```bash
-export DEEPSEEK_API_KEY=sk-xxx          # 临时，或写入 shell 配置
+export A_PROVIDER=openai
+export OPENAI_API_KEY=sk-xxx     # 已有该变量则无需设置
 ```
 
-或编辑 `~/.config/agent-cli-bash/config`（`install.sh` 已生成模板）：
+或统一写入 `~/.config/agent-cli-bash/config`（`install.sh` 已生成模板）：
 
 ```ini
-DEEPSEEK_API_KEY=sk-xxx
-DEEPSEEK_BASE_URL=https://api.deepseek.com   # 可选，默认官方地址
-DEEPSEEK_MODEL=deepseek-chat                 # 可选
+A_PROVIDER=kimi
+A_API_KEY=sk-xxx                 # 统一密钥项；未设时自动读取上表对应的环境变量
+# A_MODEL=kimi-k2-0905-preview   # 可选，覆盖默认模型
+# A_BASE_URL=...                 # 可选，覆盖 API 地址；其他 OpenAI 兼容网关由此接入
+# A_MAX_RETRIES=3                # 可选，网络错误/429/5xx 自动重试次数（0=禁用）
+# A_MAX_CONTEXT_CHARS=24000      # 可选，会话上下文字符预算
+# A_TIMEOUT=60                   # 可选，单次请求超时秒数
 ```
 
-优先级：环境变量 > 配置文件。只要 base URL 兼容 OpenAI 的 `/chat/completions`，换成任何兼容网关都可以。`A_MAX_RETRIES` 可调整网络错误与 429/5xx 的自动重试次数（默认 3，指数退避并遵循 `Retry-After` 头；0 禁用；401 等客户端错误不重试）。
+优先级：环境变量 > 配置文件；`A_API_KEY` > 提供商专属变量（如 `OPENAI_API_KEY`）。只配旧版 `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` 时行为与之前完全一致。`A_MAX_RETRIES` 可调整网络错误与 429/5xx 的自动重试次数（默认 3，指数退避并遵循 `Retry-After` 头；0 禁用；401 等客户端错误不重试）。`A_TIMEOUT` 设置单次请求超时（默认 60 秒）。
 
 ## 用法
 

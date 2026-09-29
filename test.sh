@@ -78,6 +78,8 @@ class H(BaseHTTPRequestHandler):
                 cmd = "cd /tmp"
             elif "VARTEST" in last_user:
                 cmd = "export A_TEST_VAR=shell_state_ok"
+            elif "PROVIDER" in last_user:
+                cmd = "echo PROVIDER_MODEL_OK" if body.get("model") == "kimi-k2-0905-preview" else "echo MODEL_WRONG"
             elif "TRIM0" in last_user:
                 cmd = "echo PAD_OLD_" + "P" * 300
             elif "TRIM1" in last_user:
@@ -198,6 +200,48 @@ fi
 
 out=$(printf '' | run_a zsh "--show")
 check "--show 空上下文提示" "$out" "（当前会话暂无对话上下文）"
+
+echo "== 3.5 多提供商 =="
+out=$(env A_PROVIDER=kimi A_API_KEY=sk-k A_BASE_URL="$URL" \
+    zsh -c "source '$REPO_DIR/a.sh'; a -p 'PROVIDER 测试'" 2>/dev/null)
+check "A_PROVIDER=kimi 使用默认模型" "$out" "echo PROVIDER_MODEL_OK"
+
+rc=0
+out=$(env A_PROVIDER=openai OPENAI_API_KEY=sk-o A_BASE_URL="$URL" \
+    zsh -c "source '$REPO_DIR/a.sh'; a -p '随便'" 2>/dev/null) || rc=$?
+check "自动读取 OPENAI_API_KEY" "$rc - ${out:+ok}" "0 - ok"
+
+rc=0
+out=$(env A_PROVIDER=nosuch A_API_KEY=sk-x \
+    zsh -c "source '$REPO_DIR/a.sh'; a -p 'hi'" 2>&1) || rc=$?
+check "未知提供商报错" "$rc - $(printf '%s' "$out" | grep -c '未知提供商')" "1 - 1"
+
+rc=0
+out=$(env -u DEEPSEEK_API_KEY A_CONFIG_FILE=/nonexistent A_PROVIDER=ollama A_BASE_URL="$URL" \
+    zsh -c "source '$REPO_DIR/a.sh'; a -p '随便'" 2>/dev/null) || rc=$?
+check "ollama 无密钥可用" "$rc - ${out:+ok}" "0 - ok"
+
+out=$(printf '' | run_a zsh "providers")
+if printf '%s' "$out" | grep -q openai && printf '%s' "$out" | grep -q kimi; then
+    ok "providers 列表输出"
+else
+    fail "providers 列表输出 (实际: $out)"
+fi
+
+echo "== 3.6 配置文件解析 =="
+cfg=$(mktemp "${TMPDIR:-/tmp}/a-cfg.XXXXXX")
+printf 'A_PROVIDER=kimi\nA_API_KEY=sk-k\nA_BASE_URL=%s\n' "$URL" > "$cfg"
+rc=0
+out=$(env -u DEEPSEEK_API_KEY -u A_MAX_RETRIES A_CONFIG_FILE="$cfg" \
+    zsh -c "source '$REPO_DIR/a.sh'; a -p 'PROVIDER 测试'" 2>/dev/null) || rc=$?
+check "config 文件配置提供商/密钥/地址" "$rc - $out" "0 - echo PROVIDER_MODEL_OK"
+
+printf 'A_API_KEY=sk-test\nA_BASE_URL=%s\nA_MAX_RETRIES=0\n' "$URL" > "$cfg"
+rc=0
+out=$(env -u DEEPSEEK_API_KEY -u A_MAX_RETRIES A_CONFIG_FILE="$cfg" \
+    zsh -c "source '$REPO_DIR/a.sh'; a -p 'RATELIMIT 请求'" 2>&1) || rc=$?
+check "config 文件中 A_MAX_RETRIES=0 禁用重试" "$rc - $(printf '%s' "$out" | grep -c '已自动重试')" "1 - 0"
+rm -f "$cfg"
 
 echo "== 4. 错误路径 =="
 rc=0
@@ -322,7 +366,7 @@ else
 fi
 n=$(grep -c ">>> agent-cli-bash >>>" "$TMPHOME/.zshrc")
 check "重复安装幂等（只有一块）" "$n" "1"
-grep -q "DEEPSEEK_API_KEY=" "$TMPHOME/.config/agent-cli-bash/config" \
+grep -q "A_PROVIDER=" "$TMPHOME/.config/agent-cli-bash/config" \
     && ok "生成配置模板" || fail "生成配置模板"
 (
     cd "$REPO_DIR"
