@@ -15,7 +15,7 @@
 # 支持 A_PROVIDER / A_API_KEY / A_BASE_URL / A_MODEL（`a providers` 查看内置提供商）
 # 旧版 DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL 仍然兼容
 
-A_VERSION="0.3.0"
+A_VERSION="0.4.0"
 
 # 内置提供商: 名称|默认 base URL|默认模型|API key 环境变量
 # 只要是 OpenAI /chat/completions 兼容的网关都能用 A_BASE_URL + A_MODEL 接入
