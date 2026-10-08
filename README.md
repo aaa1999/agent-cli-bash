@@ -26,6 +26,23 @@ source ~/.zshrc       # 或重启终端
 
 安装后 `a.sh`（入口）与 `lib/`（harness）需保持在同一目录内一起携带；rc 里只有一行 `source .../a.sh`，由它自己加载 `lib/`。
 
+## Windows（PowerShell 版）
+
+`win/` 目录是等价的 PowerShell 移植（Windows PowerShell 5.1 与 PowerShell 7+ 均可），与 bash 版一一对应：`win/a.ps1`（入口+产品层）、`win/lib/`（a-api/a-ctx/a-exec 三域 harness）、`win/install.ps1`。零外部依赖——HTTP 用系统自带的 `curl.exe`（Windows 10 1803+），JSON 用 PowerShell 内置的 `ConvertFrom-Json`（不需要 jq）。
+
+```powershell
+git clone <本仓库>
+cd agent-cli-bash\win
+powershell -ExecutionPolicy Bypass -File install.ps1    # pwsh 7 同样可以
+# 重开 PowerShell 后：a 找出当前目录下最大的 5 个文件
+```
+
+- 安装 = 在 `$PROFILE` 写入一行 dot-source `win\a.ps1`；卸载：`install.ps1 -Uninstall`
+- 用法（`a` / `a -p` / `a -y` / `a ask` / `a -c` / `a --show` / `a setup`）、多轮对话、ASK 反问、风险分级确认与 bash 版一致；风险规则表适配了 PowerShell/cmd 命令（`Remove-Item -Recurse -Force`、`Format-Volume`、`iwr | iex` 等）
+- 配置与 bash 版同路径同格式（`~\.config\agent-cli-bash\config`）
+- 差异：PowerShell 函数没有独立退出码，执行结果码在 `$A_LAST_RC`；管道不派生子 shell，`cd` 与 `$env:` 赋值天然在当前会话生效（普通 `$x=` 不驻留，需要时让 AI 用 `$env:` 或 `$global:`）
+- 本地测试：`pwsh -NoProfile -File win\test.ps1`（需要 python3 起 mock 服务）；`win/` 也能在 macOS/Linux 的 pwsh 里运行，测试即在此环境验证
+
 ## 配置
 
 支持多家模型提供商，`a providers` 查看内置列表：
@@ -178,6 +195,8 @@ dmesg | tail -50 | a                   # 有管道输入时，文字描述可以
 ## 开发
 
 ```bash
-bash -n a.sh && zsh -n a.sh   # 语法检查（bash/zsh 双兼容）
-bash test.sh                   # 本地 mock API 全链路测试，不访问外网
+bash -n a.sh && zsh -n a.sh            # 语法检查（bash/zsh 双兼容）
+bash test.sh                            # 本地 mock API 全链路测试，不访问外网
+
+pwsh -NoProfile -File win/test.ps1      # Windows 版同源测试（win/ 见上节）
 ```

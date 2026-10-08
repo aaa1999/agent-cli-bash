@@ -26,6 +26,23 @@ Uninstall: `./install.sh --uninstall`
 
 After installing, keep `a.sh` (the entry) and `lib/` (the harness) together in the same directory; your rc only gets one `source .../a.sh` line, and a.sh loads `lib/` itself.
 
+## Windows (PowerShell port)
+
+The `win/` directory is an equivalent PowerShell port (works on both Windows PowerShell 5.1 and PowerShell 7+), mirroring the bash version file by file: `win/a.ps1` (entry + product layer), `win/lib/` (the a-api/a-ctx/a-exec harness domains), `win/install.ps1`. Zero external dependencies — HTTP goes through the system-provided `curl.exe` (Windows 10 1803+), JSON through the built-in `ConvertFrom-Json` (no jq needed).
+
+```powershell
+git clone <this repo>
+cd agent-cli-bash\win
+powershell -ExecutionPolicy Bypass -File install.ps1    # pwsh 7 works too
+# reopen PowerShell, then: a find the 5 largest files in the current directory
+```
+
+- Installing adds one dot-source `win\a.ps1` line to `$PROFILE`; uninstall with `install.ps1 -Uninstall`
+- Usage (`a` / `a -p` / `a -y` / `a ask` / `a -c` / `a --show` / `a setup`), multi-turn context, ASK clarification, and risk-tiered confirmation all match the bash version; the risk rules cover PowerShell/cmd commands (`Remove-Item -Recurse -Force`, `Format-Volume`, `iwr | iex`, …)
+- Shares the same config path and format as the bash version (`~\.config\agent-cli-bash\config`)
+- Differences: PowerShell functions have no exit code of their own — the result code lands in `$A_LAST_RC`; pipelines spawn no subshell, so `cd` and `$env:` assignments take effect in the current session (plain `$x=` does not persist — ask the AI to use `$env:` or `$global:` when persistence matters)
+- Local tests: `pwsh -NoProfile -File win\test.ps1` (needs python3 for the mock server); `win/` also runs under pwsh on macOS/Linux, which is where the tests are verified
+
 ## Configuration
 
 Multiple model providers are supported — run `a providers` to list the built-ins:
@@ -178,6 +195,8 @@ At runtime your description plus system/cwd context is sent to the model (`tempe
 ## Development
 
 ```bash
-bash -n a.sh && zsh -n a.sh   # syntax check (bash/zsh dual compatibility)
-bash test.sh                   # full local mock-API test suite, no network access
+bash -n a.sh && zsh -n a.sh           # syntax check (bash/zsh dual compatibility)
+bash test.sh                           # full local mock-API test suite, no network access
+
+pwsh -NoProfile -File win/test.ps1     # same-source tests for the Windows port (see above)
 ```
