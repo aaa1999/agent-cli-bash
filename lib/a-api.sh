@@ -46,6 +46,7 @@ _a_load_config() {
             A_MAX_RETRIES)       [[ -n ${A_MAX_RETRIES:-}       ]] || A_MAX_RETRIES=$val ;;
             A_MAX_CONTEXT_CHARS) [[ -n ${A_MAX_CONTEXT_CHARS:-} ]] || A_MAX_CONTEXT_CHARS=$val ;;
             A_TIMEOUT)           [[ -n ${A_TIMEOUT:-}           ]] || A_TIMEOUT=$val ;;
+            A_STEP_TIMEOUT)      [[ -n ${A_STEP_TIMEOUT:-}      ]] || A_STEP_TIMEOUT=$val ;;
             A_DIR_ENTRIES)       [[ -n ${A_DIR_ENTRIES:-}       ]] || A_DIR_ENTRIES=$val ;;
             DEEPSEEK_API_KEY)  [[ -n ${DEEPSEEK_API_KEY:-}  ]] || DEEPSEEK_API_KEY=$val ;;
             DEEPSEEK_BASE_URL) [[ -n ${DEEPSEEK_BASE_URL:-} ]] || DEEPSEEK_BASE_URL=$val ;;

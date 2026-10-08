@@ -31,7 +31,7 @@ function lastline($s) { $t = astext $s; @(@($t -split "`r?`n") | Where-Object { 
 # 与本机真实配置隔离: 固定不存在的配置文件并清掉继承的配置变量
 $env:A_CONFIG_FILE = Join-Path $TestTmp 'nonexistent-config'
 foreach ($v in 'A_API_KEY', 'A_PROVIDER', 'A_BASE_URL', 'A_MODEL', 'A_MAX_RETRIES',
-               'A_MAX_CONTEXT_CHARS', 'A_TIMEOUT', 'A_DIR_ENTRIES',
+               'A_MAX_CONTEXT_CHARS', 'A_TIMEOUT', 'A_STEP_TIMEOUT', 'A_DIR_ENTRIES',
                'DEEPSEEK_API_KEY', 'DEEPSEEK_BASE_URL', 'DEEPSEEK_MODEL',
                'OPENAI_API_KEY', 'A_TEST_DIR') {
     Remove-Item "env:$v" -ErrorAction SilentlyContinue
@@ -92,6 +92,10 @@ class H(BaseHTTPRequestHandler):
                 cmd = "@'\nheredoc line1\nheredoc line2\n'@ | Set-Content -LiteralPath $env:A_HD_TEST"
             elif "BLOCKMIX" in last_user:
                 cmd = "foreach ($f in 'a','b') {\n  Write-Output \"MX_$f\"\n}\nWrite-Output MX_TAIL"
+            elif "TIMEOUT1" in last_user:
+                cmd = "Start-Sleep -Seconds 8"
+            elif "TIMEOUT2" in last_user:
+                cmd = "Write-Output SAW_TIMEOUT" if "超时" in allc else "Write-Output NO_TIMEOUT_CTX"
             elif "DANGEROUS" in last_user:
                 cmd = "sudo rm -rf /tmp/a-bad-demo"
             elif "PIPE_DATA_MARKER" in last_user:
@@ -505,6 +509,39 @@ Write-Output ok') '<# 说明
     $r = run_a_stdin 'a -y ''BLOCKMIX 请求'''
     $mx = @($r.Out -split "`r?`n" | Where-Object { $_ -match '^MX_' }) -join ','
     check '循环块与后续步骤顺序执行' $mx 'MX_a,MX_b,MX_TAIL'
+
+    Write-Host "== 5.4 步骤超时（A_STEP_TIMEOUT） =="
+    # 直连 harness: 子进程超时、退出码透传、输出捕获、secs=0 原路径
+    $tf = _a_mktemp
+    Set-Content -LiteralPath $tf -Value '' -NoNewline
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $rcT = _a_step_run 1 'Start-Sleep -Seconds 8' $tf
+    $el = $sw.Elapsed.TotalSeconds
+    check '超时返回 124' $rcT 124
+    if ($el -lt 5) { ok ("超时及时终止（{0:N1}s）" -f $el) } else { fail ("超时耗时过长（{0:N1}s）" -f $el) }
+    check '子进程 exit 透传' (_a_step_run 5 'exit 7' $tf) 7
+    check '原生命令退出码透传' (_a_step_run 5 '$global:LASTEXITCODE = 7' $tf) 7
+    check '正常执行返回 0' (_a_step_run 5 'Write-Output TD1' $tf) 0
+    check '输出捕获到 out_file' ([System.IO.File]::ReadAllText($tf, $global:_A_UTF8)) 'TD1'
+    check 'secs=0 会话内原路径' (_a_step_run 0 'Write-Output TD2' $tf) 0
+    check 'secs=0 输出同样捕获' ([System.IO.File]::ReadAllText($tf, $global:_A_UTF8)) "TD1`nTD2"
+    Remove-Item -LiteralPath $tf -Force -ErrorAction SilentlyContinue
+
+    # 全链路: A_STEP_TIMEOUT=1 下 -y 执行挂起命令 → 124 + 提示；R 消息含超时，下一轮可见
+    $env:A_STEP_TIMEOUT = '1'
+    $rcT = run_a_rc 'a -y ''TIMEOUT1 请求'' | Out-Null'
+    check 'a -y 挂起步骤超时返回 124' $rcT 124
+    check_like '超时提示显示（含调整指引）' $script:lastOut '步骤超过 1 秒未完成'
+    $out = run_a '$null = a -y ''TIMEOUT1 请求''; a -p ''TIMEOUT2 请求'''
+    check '超时情况回传下一轮对话' (lastline $out) 'Write-Output SAW_TIMEOUT'
+    # 会话状态命令不受超时看护（瞬时完成，走当前会话分支）
+    $tmpd = Join-Path $TestTmp 'cd-timeout'
+    New-Item -ItemType Directory -Path $tmpd -Force | Out-Null
+    $env:A_TEST_DIR = $tmpd
+    $out = run_a '$null = a -y ''CDTEST 请求''; (Get-Location).Path'
+    check '会话状态命令不受超时影响' (lastline $out) $tmpd
+    Remove-Item env:A_TEST_DIR -ErrorAction SilentlyContinue
+    Remove-Item env:A_STEP_TIMEOUT -ErrorAction SilentlyContinue
 
     Write-Host "== 6. setup 工具函数与配置合并 =="
     check '密钥掩码保留首尾' (_a_mask_key 'sk-abcdefgh1234') 'sk-a***1234'

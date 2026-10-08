@@ -151,15 +151,112 @@ function _a_split_steps([string]$Cmd) {
     return $out
 }
 
+# 单步执行（超时看护）。Secs 为 0 时在当前会话 Invoke-Expression 执行（原路径，
+# 输出实时显示并捕获）；大于 0 时在子进程 pwsh -NoProfile 中执行——PowerShell
+# 语句无法在进程内安全中断，超时看护只能以独立进程为界，Stop-Process 即终止。
+#   - 步骤文本经环境变量传入子进程、以 -EncodedCommand 启动引导脚本，无引号转义问题
+#   - 子进程退出码即步骤退出码（原生命令的 $LASTEXITCODE 由引导脚本 exit 透传）
+#   - 超过 Secs 未结束: Kill 整棵进程树（pwsh 7+，5.1 退化为单进程），返回 124
+#     （对齐 bash 版与 GNU timeout 习惯），提示由调用方打印
+#   - 输出行级流式回显（stdout 逐行、stderr 汇总在结束时），并捕获到 OutFile
+# 显示一律走 [Console]::Out/Error: 不进 PowerShell 管道，函数返回值只含退出码，
+# 调用方以 $rc = _a_step_run ... 赋值时也不会把显示内容吞进变量。
+function _a_step_run([int]$Secs, [string]$Step, [string]$OutFile) {
+    if ($Secs -le 0) {
+        $global:LASTEXITCODE = 0
+        try {
+            Invoke-Expression $Step 2>&1 | ForEach-Object {
+                [Console]::Out.WriteLine("$_")
+                [System.IO.File]::AppendAllText($OutFile, "$_`n", $global:_A_UTF8)
+            }
+        } catch { Write-Host "$_" -ForegroundColor Red }
+        return (_a_step_rc)
+    }
+    # 子进程宿主: 优先取当前 pwsh 的可执行文件，取不到时按 $PSHOME 推断
+    $exe = $null
+    try { $exe = (Get-Process -Id $PID).Path } catch { }
+    if (-not $exe -or -not (Test-Path -LiteralPath $exe)) {
+        foreach ($cand in @((Join-Path $PSHOME 'pwsh'), (Join-Path $PSHOME 'powershell'))) {
+            if (Test-Path -LiteralPath $cand) { $exe = $cand; break }
+        }
+    }
+    if (-not $exe) { Write-Host 'a: 无法定位子进程宿主，跳过超时看护' -ForegroundColor Red; return (_a_step_run 0 $Step $OutFile) }
+
+    $bootstrap = @'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$ErrorActionPreference = 'Continue'
+Invoke-Expression $env:A_STEP_SCRIPT
+if ($LASTEXITCODE -is [int] -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+exit $(if ($?) { 0 } else { 1 })
+'@
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.Arguments = '-NoProfile -EncodedCommand ' + [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($bootstrap))
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    $psi.EnvironmentVariables['A_STEP_SCRIPT'] = $Step
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $tErr = $p.StandardError.ReadToEndAsync()
+    $tOut = $p.StandardOutput.ReadLineAsync()
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $timed = $false
+    $emit = {
+        param($l)
+        [Console]::Out.WriteLine($l)
+        [System.IO.File]::AppendAllText($OutFile, "$l`n", $global:_A_UTF8)
+    }
+    try {
+        while ($true) {
+            if ($tOut.IsCompleted -or $tOut.Wait(150)) {
+                $line = $tOut.Result
+                if ($null -eq $line) { break }
+                & $emit $line
+                $tOut = $p.StandardOutput.ReadLineAsync()
+                continue
+            }
+            if ($p.HasExited) {
+                while ($tOut.IsCompleted -or $tOut.Wait(150)) {   # 排空缓冲中的剩余输出
+                    $line = $tOut.Result
+                    if ($null -eq $line) { break }
+                    & $emit $line
+                    $tOut = $p.StandardOutput.ReadLineAsync()
+                }
+                break
+            }
+            if ($sw.ElapsedMilliseconds -ge $Secs * 1000) { $timed = $true; break }
+        }
+    } finally {
+        if (-not $p.HasExited) {
+            try { $p.Kill($true) } catch { try { $p.Kill() } catch { } }
+        }
+        try { $p.WaitForExit() } catch { }
+    }
+    $errText = ''
+    try { $errText = "$($tErr.Result)".TrimEnd("`r", "`n") } catch { }
+    if ($errText -ne '') {
+        [Console]::Error.WriteLine($errText)
+        [System.IO.File]::AppendAllText($OutFile, "$errText`n", $global:_A_UTF8)
+    }
+    if ($timed) { return 124 }
+    return $p.ExitCode
+}
+
 # 多步确认执行: 把 <cmd> 按完整 PowerShell 结构切成步骤（_a_split_steps，跨行的
 # foreach/here-string 等作为一步），逐步显示风险并询问 y/n/i；
-# 高危命令即使 -y 也强制确认，无终端一律拒绝；会话状态命令直行不捕获。
+# 高危命令即使 -y 也强制确认，无终端一律拒绝；会话状态命令在当前会话直行不捕获
+# （这类命令瞬时完成，不设超时）；其余步骤受 A_STEP_TIMEOUT（默认 600s，0=禁用）
+# 看护——在子进程 pwsh 中执行，超时终止后返回 124。
 # 执行结果摘要（R 消息）回写到 <mode> 的会话；最后退出码写入 $global:A_LAST_RC，
 # 用户终止时为 130。（PowerShell 函数没有独立退出码，a 的调用方以 $global:A_LAST_RC 取值）
 function _a_exec_steps([string]$Mode, [int]$AutoYes, [string]$Cmd) {
     $steps = @(_a_split_steps $Cmd)
     $total = $steps.Count
-    $n = 0; $executed = 0; $skipped = 0; $stopped_at = 0; $rc = 0; $state_executed = 0
+    $n = 0; $executed = 0; $skipped = 0; $stopped_at = 0; $rc = 0; $state_executed = 0; $timed_steps = 0
+    $stepSecs = 600
+    if ($env:A_STEP_TIMEOUT -match '^\d+$') { $stepSecs = [int]$env:A_STEP_TIMEOUT }
     $out_file = _a_mktemp
     Set-Content -LiteralPath $out_file -Value '' -NoNewline
 
@@ -214,20 +311,18 @@ function _a_exec_steps([string]$Mode, [int]$AutoYes, [string]$Cmd) {
         }
 
         $executed++
-        $global:LASTEXITCODE = 0
         if (_a_shell_state $step) {
-            # 会话状态命令直接执行、输出实时显示但不捕获（cd/$env: 在当前会话生效）
+            # 会话状态命令直接在当前会话执行、输出实时显示但不捕获（cd/$env: 生效）；
+            # 瞬时完成，不设超时
             try { Invoke-Expression $step 2>&1 | Out-Host } catch { Write-Host "$_" -ForegroundColor Red }
             $rc = _a_step_rc
             $state_executed++
         } else {
-            try {
-                Invoke-Expression $step 2>&1 | ForEach-Object {
-                    "$_"
-                    [System.IO.File]::AppendAllText($out_file, "$_`n", $global:_A_UTF8)
-                }
-            } catch { Write-Host "$_" -ForegroundColor Red }
-            $rc = _a_step_rc
+            $rc = _a_step_run $stepSecs $step $out_file
+            if ($rc -eq 124) {
+                $timed_steps++
+                Write-Host "⏱  步骤超过 $stepSecs 秒未完成，已终止（A_STEP_TIMEOUT 可调大或设 0 禁用）"
+            }
         }
     }
 
@@ -254,6 +349,9 @@ function _a_exec_steps([string]$Mode, [int]$AutoYes, [string]$Cmd) {
     }
     if ($state_executed -gt 0) {
         $summary += "（其中 $state_executed 步为会话状态命令 cd/`$env: 等，已在当前会话生效，输出未捕获）"
+    }
+    if ($timed_steps -gt 0) {
+        $summary += "（$timed_steps 步超过 $stepSecs 秒被超时终止——命令可能未完成；如需更久可让用户调大 A_STEP_TIMEOUT 或设 0 禁用后改用后台运行）"
     }
     $rMsg = ConvertTo-Json -InputObject ([ordered]@{ role = 'user'; content = "$summary`n输出(可能截断):`n$out_tail" }) -Compress
     _a_conv_append $Mode 'R' $rMsg

@@ -81,6 +81,12 @@ class H(BaseHTTPRequestHandler):
                 cmd = "cat > /tmp/a-hd-test.txt << 'EOF'\nheredoc line1\nheredoc line2\nEOF"
             elif "BLOCKMIX" in last_user:
                 cmd = "for f in a b; do\n  echo \"MX_$f\"\ndone\necho MX_TAIL"
+            elif "TIMEOUT1" in last_user:
+                cmd = "sleep 8"
+            elif "SLEEP30" in last_user:
+                cmd = "sleep 30"
+            elif "TIMEOUT2" in last_user:
+                cmd = "echo SAW_TIMEOUT" if "超时" in allc else "echo NO_TIMEOUT_CTX"
             elif "DANGEROUS" in last_user:
                 cmd = "sudo rm -rf /tmp/a-bad-demo"
             elif "PIPE_DATA_MARKER" in last_user:
@@ -697,6 +703,85 @@ rm -f /tmp/a-hd-test.txt
 
 out=$(run_a zsh "-y 'BLOCKMIX 请求'")
 check "循环块与后续步骤顺序执行" "$out" $'MX_a\nMX_b\nMX_TAIL'
+
+echo "== 5.4 步骤超时（A_STEP_TIMEOUT） =="
+# 直连 harness: _a_step_run 在双壳下的超时/退出码/输出捕获
+step_run() { # step_run <shell> <secs> <cmd>  → "rc elapsed out..."
+    local sh=$1 secs=$2 cmd=$3 outf t0 t1 rc
+    outf=$(mktemp "${TMPDIR:-/tmp}/a-st.XXXXXX")
+    t0=$(date +%s)
+    STEP_CMD="$cmd" A_OUTF="$outf" $sh -c "source '$REPO_DIR/a.sh'; _a_step_run '$secs' \"\$STEP_CMD\" \"\$A_OUTF\"" >/dev/null 2>&1
+    rc=$?
+    t1=$(date +%s)
+    printf '%s %s %s' "$rc" "$((t1 - t0))" "$(cat "$outf")"
+    rm -f "$outf"
+}
+for sh in bash zsh; do
+    r=$(step_run "$sh" 1 'sleep 8')
+    rc=${r%% *}; rest=${r#* }; el=${rest%% *}
+    check "$sh 超时返回 124" "$rc" "124"
+    if [[ $el -le 4 ]]; then ok "$sh 超时及时终止（${el}s）"; else fail "$sh 超时耗时过长（${el}s）"; fi
+    if pgrep -f 'sleep 8' >/dev/null; then
+        sleep 2; pgrep -f 'sleep 8' >/dev/null && fail "$sh 超时后子进程残留" || ok "$sh 残留进程已被清出"
+    else
+        ok "$sh 超时后无残留"
+    fi
+    check "$sh 退出码透传" "$(step_run "$sh" 5 'exit 7' | cut -d' ' -f1)" "7"
+    r=$(step_run "$sh" 0 'echo TIMED0')
+    check "$sh secs=0 原路径（rc 与输出）" "${r%% *} ${r#* * }" "0 TIMED0"
+    r=$(step_run "$sh" 5 'echo TEECAP')
+    check "$sh 输出捕获到 out_file" "${r#* * }" "TEECAP"
+done
+
+# 全链路: A_STEP_TIMEOUT=1 下 -y 执行挂起命令 → 124 + 提示；R 消息含超时，下一轮可见
+out2=$(env A_STEP_TIMEOUT=1 DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL" \
+    zsh -c "source '$REPO_DIR/a.sh'; a -y 'TIMEOUT1 请求'" 2>&1); rc=$?
+check "zsh -y 挂起步骤超时返回 124" "$rc" "124"
+if printf '%s' "$out2" | grep -q '步骤超过 1s 未完成'; then
+    ok "超时提示显示（含调整指引）"
+else
+    fail "超时提示显示 (实际: $out2)"
+fi
+out=$(env A_STEP_TIMEOUT=1 DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL" \
+    zsh -c "source '$REPO_DIR/a.sh'; a -y 'TIMEOUT1 请求' >/dev/null 2>&1; a -p 'TIMEOUT2 请求'" 2>/dev/null)
+check "超时情况回传下一轮对话" "$out" "echo SAW_TIMEOUT"
+
+# 会话状态命令不受超时看护（瞬时完成，走当前 shell 分支）
+out=$(env A_STEP_TIMEOUT=1 DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL" \
+    zsh -c "source '$REPO_DIR/a.sh'; cd /tmp; a -y 'CDTEST 请求'; pwd" 2>/dev/null)
+check "shell 状态命令不受超时影响" "$out" "/tmp"
+
+# Ctrl-C 转发（交互式伪终端）: 步骤挂起时按 ^C，应立即返回提示符且不留残留进程
+if command -v expect >/dev/null 2>&1; then
+    A_TEST_CMD="$REPO_DIR/a.sh" expect -c '
+        set timeout 12
+        spawn zsh --no-rcs -i
+        expect -re {% $}
+        send "PS1=\x27P> \x27\r"
+        expect -re {P> $}
+        send "source $env(A_TEST_CMD)\r"
+        expect -re {P> $}
+        send "A_STEP_TIMEOUT=0 a -y \x27SLEEP30 请求\x27\r"
+        sleep 2
+        send "\x03"
+        expect {
+            -re {P> $} { }
+            timeout { exit 9 }
+        }
+        send "echo PGR=\$(pgrep -c -f \x27sleep 30\x27)\r"
+        expect {
+            -re {PGR=(\d+)} { set n $expect_out(1,string) }
+            timeout { exit 8 }
+        }
+        send "exit\r"
+        expect eof
+        exit $n
+    ' 2>/dev/null; cc_rc=$?
+    check "Ctrl-C 中断挂起步骤" "$cc_rc" "0"
+    pkill -f 'sleep 30' 2>/dev/null
+else
+    echo "  （未安装 expect，跳过 Ctrl-C 测试）"
+fi
 
 echo "== 6. install.sh 安装/卸载 =="
 TMPHOME=$(mktemp -d)

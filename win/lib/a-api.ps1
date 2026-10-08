@@ -62,7 +62,7 @@ function _a_load_config {
     $f = if ($env:A_CONFIG_FILE) { $env:A_CONFIG_FILE } else { Join-Path $HOME '.config/agent-cli-bash/config' }
     if (-not (Test-Path -LiteralPath $f)) { return }
     $known = 'A_PROVIDER', 'A_API_KEY', 'A_BASE_URL', 'A_MODEL', 'A_MAX_RETRIES', 'A_MAX_CONTEXT_CHARS',
-             'A_TIMEOUT', 'A_DIR_ENTRIES', 'DEEPSEEK_API_KEY', 'DEEPSEEK_BASE_URL', 'DEEPSEEK_MODEL'
+             'A_TIMEOUT', 'A_STEP_TIMEOUT', 'A_DIR_ENTRIES', 'DEEPSEEK_API_KEY', 'DEEPSEEK_BASE_URL', 'DEEPSEEK_MODEL'
     foreach ($line in [System.IO.File]::ReadAllLines($f)) {
         if ($line -notmatch '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { continue }
         $key = $Matches[1]; $val = $Matches[2]

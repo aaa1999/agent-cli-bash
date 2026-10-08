@@ -70,6 +70,7 @@ A_API_KEY=
 # A_MAX_RETRIES=3            # 网络错误/429/5xx 自动重试次数（0=禁用）
 # A_MAX_CONTEXT_CHARS=24000  # 会话上下文字符预算
 # A_TIMEOUT=60               # 单次请求超时秒数
+# A_STEP_TIMEOUT=600         # 单步命令执行超时秒数（0=禁用）；超时终止该步，退出码 124
 # A_DIR_ENTRIES=15           # 目录条目注入上限（0=不注入）；超出时相关的优先、其余按修改时间
 EOF
     chmod 600 "$config_file"

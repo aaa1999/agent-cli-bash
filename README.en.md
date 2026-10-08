@@ -40,7 +40,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1    # pwsh 7 works too
 - Installing adds one dot-source `win\a.ps1` line to `$PROFILE`; uninstall with `install.ps1 -Uninstall`
 - Usage (`a` / `a -p` / `a -y` / `a ask` / `a -c` / `a --show` / `a setup`), multi-turn context, ASK clarification, and risk-tiered confirmation all match the bash version; the risk rules cover PowerShell/cmd commands (`Remove-Item -Recurse -Force`, `Format-Volume`, `iwr | iex`, …)
 - Shares the same config path and format as the bash version (`~\.config\agent-cli-bash\config`)
-- Differences: PowerShell functions have no exit code of their own — the result code lands in `$A_LAST_RC`; pipelines spawn no subshell, so `cd` and `$env:` assignments take effect in the current session (plain `$x=` does not persist — ask the AI to use `$env:` or `$global:` when persistence matters)
+- Differences: with the per-step timeout active (`A_STEP_TIMEOUT`, default 600 s, 0 disables) ordinary steps run in a child `pwsh -NoProfile` (PowerShell statements cannot be interrupted in-process), so session-defined ad-hoc functions/aliases are not visible to them; a timed-out step is killed with result code 124. PowerShell functions have no exit code of their own — the result code lands in `$A_LAST_RC`; pipelines spawn no subshell, so `cd` and `$env:` assignments take effect in the current session (plain `$x=` does not persist — ask the AI to use `$env:` or `$global:` when persistence matters)
 - Local tests: `pwsh -NoProfile -File win\test.ps1` (needs python3 for the mock server); `win/` also runs under pwsh on macOS/Linux, which is where the tests are verified
 
 ## Configuration
@@ -75,10 +75,11 @@ A_API_KEY=sk-xxx                 # unified key; if unset, the provider's env var
 # A_MAX_RETRIES=3                # optional, auto retries on network errors / 429/5xx (0 disables)
 # A_MAX_CONTEXT_CHARS=24000      # optional, session context character budget
 # A_TIMEOUT=60                   # optional, per-request timeout in seconds
+# A_STEP_TIMEOUT=600             # optional, per-step execution timeout in seconds (0 disables); the step is killed with exit code 124
 # A_DIR_ENTRIES=15               # optional, directory-entry context cap (0 disables); relevant entries first, rest by mtime
 ```
 
-Precedence: environment variables > config file; `A_API_KEY` > provider-specific vars (e.g. `OPENAI_API_KEY`). With only the legacy `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` set, behavior is unchanged from previous versions. `A_MAX_RETRIES` controls automatic retries on network errors and HTTP 429/5xx (default 3, exponential backoff honoring `Retry-After`; 0 disables; client errors like 401 are never retried). `A_TIMEOUT` sets the per-request timeout (default 60 s). `A_DIR_ENTRIES` caps the directory entries injected as context (default 15, 0 disables).
+Precedence: environment variables > config file; `A_API_KEY` > provider-specific vars (e.g. `OPENAI_API_KEY`). With only the legacy `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` set, behavior is unchanged from previous versions. `A_MAX_RETRIES` controls automatic retries on network errors and HTTP 429/5xx (default 3, exponential backoff honoring `Retry-After`; 0 disables; client errors like 401 are never retried). `A_TIMEOUT` sets the per-request timeout (default 60 s). `A_STEP_TIMEOUT` sets a per-step execution timeout (default 600 s, 0 disables) — it stops commands that hang forever (e.g. `tail -f`): on expiry the whole command process group is terminated (TERM, then KILL) and 124 is returned; the timeout is recorded into the conversation so the model can react on the next turn. Shell-state commands (`cd`, variables, …) are never timed out. `A_DIR_ENTRIES` caps the directory entries injected as context (default 15, 0 disables).
 
 Key safety: the config file is automatically tightened to 600 permissions (owner-only) both when loaded and when written by `a setup`; request headers are passed to curl via a `-K` temp file, so the key never appears in process arguments (invisible to `ps`).
 
@@ -188,7 +189,7 @@ The code is split into a product layer and a harness, with dependencies pointing
 - `a.sh` — entry & product layer: routing of the `a` command, each capability's system prompt and output parsing (command mode strips fences, handles ASK follow-ups), plus the confirmation/execution UX;
 - `lib/a-api.sh` — transport: provider table, config I/O (`a setup`), the SSE streaming client with automatic retries;
 - `lib/a-ctx.sh` — context: per-mode conversation storage and trimming, smart directory-entry selection, git/shell-history gathering;
-- `lib/a-exec.sh` — execution: command structure splitting (multi-line blocks/heredocs stay together as one step), risk classification, shell-state detection, the multi-step confirmation executor and terminal interaction helpers.
+- `lib/a-exec.sh` — execution: command structure splitting (multi-line blocks/heredocs stay together as one step), risk classification, shell-state detection, per-step timeout guarding (`A_STEP_TIMEOUT`, default 600 s, kills the whole group with exit 124), the multi-step confirmation executor and terminal interaction helpers.
 
 At runtime your description plus system/cwd context is sent to the model (`temperature=0`, instructed to return only the command), and executed via `eval` after your confirmation. Adding a capability = one mode function in the product layer (its own prompt and output policy) reusing the harness transport and context — `a ask` is the first example.
 

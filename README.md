@@ -40,7 +40,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1    # pwsh 7 同样可以
 - 安装 = 在 `$PROFILE` 写入一行 dot-source `win\a.ps1`；卸载：`install.ps1 -Uninstall`
 - 用法（`a` / `a -p` / `a -y` / `a ask` / `a -c` / `a --show` / `a setup`）、多轮对话、ASK 反问、风险分级确认与 bash 版一致；风险规则表适配了 PowerShell/cmd 命令（`Remove-Item -Recurse -Force`、`Format-Volume`、`iwr | iex` 等）
 - 配置与 bash 版同路径同格式（`~\.config\agent-cli-bash\config`）
-- 差异：PowerShell 函数没有独立退出码，执行结果码在 `$A_LAST_RC`；管道不派生子 shell，`cd` 与 `$env:` 赋值天然在当前会话生效（普通 `$x=` 不驻留，需要时让 AI 用 `$env:` 或 `$global:`）
+- 差异：步骤超时（`A_STEP_TIMEOUT`，默认 600s，0 禁用）下普通步骤在子进程 `pwsh -NoProfile` 中执行（PowerShell 语句无法进程内中断），会话内临时定义的函数/别名对其不可见，超时终止该步、结果码 124；PowerShell 函数没有独立退出码，执行结果码在 `$A_LAST_RC`；管道不派生子 shell，`cd` 与 `$env:` 赋值天然在当前会话生效（普通 `$x=` 不驻留，需要时让 AI 用 `$env:` 或 `$global:`）
 - 本地测试：`pwsh -NoProfile -File win\test.ps1`（需要 python3 起 mock 服务）；`win/` 也能在 macOS/Linux 的 pwsh 里运行，测试即在此环境验证
 
 ## 配置
@@ -75,10 +75,11 @@ A_API_KEY=sk-xxx                 # 统一密钥项；未设时自动读取上表
 # A_MAX_RETRIES=3                # 可选，网络错误/429/5xx 自动重试次数（0=禁用）
 # A_MAX_CONTEXT_CHARS=24000      # 可选，会话上下文字符预算
 # A_TIMEOUT=60                   # 可选，单次请求超时秒数
+# A_STEP_TIMEOUT=600             # 可选，单步命令执行超时秒数（0=禁用）；超时终止该步，退出码 124
 # A_DIR_ENTRIES=15               # 可选，目录条目注入上限（0=不注入）；超出时与请求相关的优先、其余按修改时间
 ```
 
-优先级：环境变量 > 配置文件；`A_API_KEY` > 提供商专属变量（如 `OPENAI_API_KEY`）。只配旧版 `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` 时行为与之前完全一致。`A_MAX_RETRIES` 可调整网络错误与 429/5xx 的自动重试次数（默认 3，指数退避并遵循 `Retry-After` 头；0 禁用；401 等客户端错误不重试）。`A_TIMEOUT` 设置单次请求超时（默认 60 秒）。`A_DIR_ENTRIES` 控制注入的目录条目上限（默认 15，0 为不注入）。
+优先级：环境变量 > 配置文件；`A_API_KEY` > 提供商专属变量（如 `OPENAI_API_KEY`）。只配旧版 `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` 时行为与之前完全一致。`A_MAX_RETRIES` 可调整网络错误与 429/5xx 的自动重试次数（默认 3，指数退避并遵循 `Retry-After` 头；0 禁用；401 等客户端错误不重试）。`A_TIMEOUT` 设置单次请求超时（默认 60 秒）。`A_STEP_TIMEOUT` 为每步命令设执行超时（默认 600 秒，0 禁用）——防止 `tail -f` 之类挂住不退出，超时先 TERM 后 KILL 整个命令进程组并返回 124，超时情况会记入对话上下文供 AI 下一轮参考；`cd`/变量等 shell 状态命令不设超时。`A_DIR_ENTRIES` 控制注入的目录条目上限（默认 15，0 为不注入）。
 
 密钥安全：配置文件在加载和 `a setup` 写入时都会自动收紧为 600 权限（仅属主可读写）；请求头经 `-K` 临时文件传给 curl，密钥不会出现在进程参数中（`ps` 不可见）。
 
@@ -188,7 +189,7 @@ dmesg | tail -50 | a                   # 有管道输入时，文字描述可以
 - `a.sh` —— 入口与产品层：`a` 命令路由、各能力的 system prompt 与输出解析（命令模式清洗围栏、ASK 反问）、确认与执行的 UX；
 - `lib/a-api.sh` —— 传输域：提供商表、配置读写（`a setup`）、SSE 流式客户端与自动重试；
 - `lib/a-ctx.sh` —— 上下文域：按模式分键的会话存储与裁剪、目录智能选取、git/终端历史采集；
-- `lib/a-exec.sh` —— 执行域：命令结构切分（跨行块/heredoc 聚合为一步）、风险分级、shell 状态识别、多步确认执行器与终端交互件。
+- `lib/a-exec.sh` —— 执行域：命令结构切分（跨行块/heredoc 聚合为一步）、风险分级、shell 状态识别、步骤超时看护（`A_STEP_TIMEOUT`，默认 600s，超时杀整组返回 124）、多步确认执行器与终端交互件。
 
 运行时把你的描述 + 当前系统/目录上下文发给模型（`temperature=0`，要求只返回命令），确认后 `eval` 执行。新增一种能力 = 在产品层加一个模式函数（自己的 prompt 与输出策略），复用 harness 的传输与上下文（`a ask` 即首个例子）。
 

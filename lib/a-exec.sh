@@ -182,13 +182,72 @@ _a_split_steps() {
     '
 }
 
+# 单步执行（超时看护）。secs 为 0 时按原路径执行（eval | tee，输出实时流式）；
+# 大于 0 时步骤转入后台独立执行，监视器计时——
+#   - 正常完成: 命令退出码经 rc 文件中转回传（后台管道 $? 拿到的是 tee 的退出码）
+#   - 超过 secs: 先 TERM 后 KILL 整个命令进程组；拿不到独立进程组（如非交互 zsh）
+#     时退化为递归终止进程树，尽力清干净子进程。返回 124（对齐 GNU timeout 习惯）
+#   - Ctrl-C: 转发给步骤进程后以 130 退出
+# 进程组 id 以 ps 探测为准: zsh 交互式下 $! 是管道末端的 pid 而非组长，不能直接
+# kill -- -$!；探测不到独立组（与当前组相同）则说明没有任务控制，走进程树兜底。
+# 子 shell 的 stderr 全程丢弃——作业终止通知（Terminated ...）与 set -m 的报错
+# 不应污染终端；用户可见的超时提示由调用方按退出码 124 打印。
+_a_step_run() { # _a_step_run <secs> <step> <out_file>
+    local secs=$1 step=$2 out_file=$3
+    if [[ $secs -le 0 ]]; then
+        eval "$step" 2>&1 | tee -a "$out_file"
+        return ${PIPESTATUS[0]:-${pipestatus[1]:-0}}
+    fi
+    local rc_file flag
+    rc_file=$(mktemp "${TMPDIR:-/tmp}/a-rc.XXXXXX"); rm -f "$rc_file"
+    flag=$(mktemp "${TMPDIR:-/tmp}/a-tflag.XXXXXX"); rm -f "$flag"
+    (
+        # zsh 在函数上下文里 set -m 会直接终止子 shell，不能开；其交互式 shell
+        # 默认 monitor 开启，后台任务本就在独立进程组。bash 则显式开启 job control
+        [[ -n ${ZSH_VERSION:-} ]] || set -m 2>/dev/null || true
+        { eval "$step" 2>&1 | tee -a "$out_file"
+          printf '%s\n' "${PIPESTATUS[0]:-${pipestatus[1]:-0}}" > "$rc_file"; } &
+        local job=$! wd rc=0 jobpg mypg grouped=0
+        jobpg=$(ps -o pgid= -p "$job" 2>/dev/null | tr -d ' ')
+        mypg=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')
+        [[ $jobpg =~ ^[0-9]+$ && $mypg =~ ^[0-9]+$ && $jobpg != "$mypg" ]] && grouped=1
+        kt() { # 递归终止进程树（无独立进程组时的兜底）: 先子后己
+            local c
+            for c in $(pgrep -P "$1" 2>/dev/null); do kt "$c" "$2"; done
+            kill -"$2" "$1" 2>/dev/null
+        }
+        ( sleep "$secs"
+          kill -0 "$job" 2>/dev/null || exit 0
+          printf x > "$flag"
+          if [[ $grouped == 1 ]]; then kill -TERM -- "-$jobpg" 2>/dev/null
+          else kt "$job" TERM; fi
+          sleep 1
+          if [[ $grouped == 1 ]]; then kill -KILL -- "-$jobpg" 2>/dev/null
+          else kt "$job" KILL; fi ) &
+        wd=$!
+        trap 'if [[ $grouped == 1 ]]; then kill -TERM -- "-$jobpg" 2>/dev/null; else kt "$job" TERM; fi; exit 130' INT
+        wait "$job"; rc=$?
+        kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
+        if [[ -e $flag ]]; then
+            exit 124
+        fi
+        [[ -r $rc_file ]] && rc=$(cat "$rc_file" 2>/dev/null)
+        exit "$rc"
+    ) 2>/dev/null
+}
+
 # 多步确认执行: 把 <cmd> 按完整 shell 结构切成步骤（_a_split_steps，跨行的
 # for/heredoc 等作为一步），逐步显示风险并询问 y/n/i；
-# 高危命令即使 -y 也强制确认，无终端一律拒绝；shell 状态命令在当前 shell 执行。
+# 高危命令即使 -y 也强制确认，无终端一律拒绝；shell 状态命令在当前 shell 执行
+# （这类命令瞬时完成，不设超时）；其余步骤受 A_STEP_TIMEOUT（默认 600s，0=禁用）
+# 看护，超时终止后返回 124。
 # 执行结果摘要（R 消息）回写到 <mode> 的会话；返回最后一步退出码，用户终止返回 130。
 _a_exec_steps() { # _a_exec_steps <mode> <auto_yes> <cmd>
     local mode=$1 auto_yes=$2 cmd=$3
     local risk reply step
+    local step_secs=${A_STEP_TIMEOUT:-600}
+    [[ $step_secs =~ ^[0-9]+$ ]] || step_secs=600
+    local timed_steps=0
     local -a steps
     steps=()
     while IFS= read -rd $'\036' step; do
@@ -258,8 +317,12 @@ _a_exec_steps() { # _a_exec_steps <mode> <auto_yes> <cmd>
             rc=$?
             state_executed=$((state_executed + 1))
         else
-            eval "$step" 2>&1 | tee -a "$out_file"
-            rc=${PIPESTATUS[0]:-${pipestatus[1]:-0}}
+            _a_step_run "$step_secs" "$step" "$out_file"
+            rc=$?
+            if [[ $rc == 124 ]]; then
+                timed_steps=$((timed_steps + 1))
+                printf '⏱  步骤超过 %ss 未完成，已终止（A_STEP_TIMEOUT 可调大或设 0 禁用）\n' "$step_secs" >&2
+            fi
         fi
     done
 
@@ -283,6 +346,9 @@ _a_exec_steps() { # _a_exec_steps <mode> <auto_yes> <cmd>
     fi
     if [[ $state_executed -gt 0 ]]; then
         summary="$summary（其中 $state_executed 步为 shell 状态命令 cd/变量等，已在当前 shell 生效，输出未捕获）"
+    fi
+    if [[ $timed_steps -gt 0 ]]; then
+        summary="$summary（$timed_steps 步超过 ${step_secs}s 被超时终止——命令可能未完成；如需更久可让用户调大 A_STEP_TIMEOUT 或设 0 禁用后改用 nohup/后台运行）"
     fi
     _a_conv_append "$mode" R "$(printf '{"role":"user","content":"%s"}' "$(_a_json_escape "$summary
 输出(可能截断):
