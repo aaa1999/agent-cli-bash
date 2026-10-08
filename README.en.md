@@ -24,6 +24,8 @@ source ~/.zshrc       # or restart your terminal
 
 Uninstall: `./install.sh --uninstall`
 
+After installing, keep `a.sh` (the entry) and `lib/` (the harness) together in the same directory; your rc only gets one `source .../a.sh` line, and a.sh loads `lib/` itself.
+
 ## Configuration
 
 Multiple model providers are supported — run `a providers` to list the built-ins:
@@ -70,6 +72,7 @@ Key safety: the config file is automatically tightened to 600 permissions (owner
 | `a <natural language>` | Generate a command, confirm, execute |
 | `a -p <natural language>` | Print the command only, never execute (pipe-friendly) |
 | `a -y <natural language>` | Skip the normal confirmation (dangerous commands still ask) |
+| `a ask <question>` | Free-form Q&A: get an answer directly, no command generated or executed; pipes supported |
 | `a -c` | Clear this session's conversation context |
 | `a --show` | Inspect session context (turns / size / trimming) |
 | `a providers` | List built-in model providers |
@@ -123,13 +126,13 @@ The context sent to the AI each turn includes:
 
 **The AI never invents file names — it asks**: the system prompt requires exact names from the context to interpret your loose wording. If the file you refer to is still ambiguous or absent, the AI asks back with a `❓` question (e.g. "multiple iso files here — which one's sha256 do you want?"); type your clarification and the command is **regenerated in the same turn** (at most 3 follow-ups), or press Enter to cancel. Without a terminal (scripts/CI) it prints the question and exits safely without executing anything.
 
-Context is isolated per shell session (separate terminal windows don't interfere); `a -c` clears it anytime. Size is doubly bounded: at most 40 messages, and within a character budget (`A_MAX_CONTEXT_CHARS`, default 24000 ≈ 12K tokens) **whole turns** are kept from newest to oldest (request + command + result stay together, never split); turns beyond the budget are dropped, the latest turn is always kept.
+Context is isolated per shell session (separate terminal windows don't interfere); `a -c` clears it anytime. Command (`a`) and Q&A (`a ask`) contexts are stored per mode and never mixed; `a -c` clears both. Size is doubly bounded: at most 40 messages, and within a character budget (`A_MAX_CONTEXT_CHARS`, default 24000 ≈ 12K tokens) **whole turns** are kept from newest to oldest (request + command + result stay together, never split); turns beyond the budget are dropped, the latest turn is always kept.
 
 Use `a --show` anytime to see what has accumulated and what the next turn will actually send:
 
 ```console
 $ a --show
-Session context: 4 messages / 243 bytes, budget 24000, next turn will send 4 / 243 bytes (a -c to clear)
+[run] Session context: 4 messages / 243 bytes, budget 24000, next turn will send 4 / 243 bytes (a -c to clear)
   Turn 1  find the largest files
           Command: du -ah . | sort -rh | head -5
   Turn 2  only the top 3
@@ -163,7 +166,14 @@ dmesg | tail -50 | a                           # with piped input, the descripti
 
 ## How it works
 
-`a.sh` defines a shell function: it sends your description plus system/cwd context to DeepSeek (`temperature=0`, instructed to return only the command), strips markdown fences from the reply, and `eval`s it after your confirmation.
+The code is split into a product layer and a harness, with dependencies pointing one way:
+
+- `a.sh` — entry & product layer: routing of the `a` command, each capability's system prompt and output parsing (command mode strips fences, handles ASK follow-ups), plus the confirmation/execution UX;
+- `lib/a-api.sh` — transport: provider table, config I/O (`a setup`), the SSE streaming client with automatic retries;
+- `lib/a-ctx.sh` — context: per-mode conversation storage and trimming, smart directory-entry selection, git/shell-history gathering;
+- `lib/a-exec.sh` — execution: command risk classification, shell-state detection, the multi-step confirmation executor and terminal interaction helpers.
+
+At runtime your description plus system/cwd context is sent to the model (`temperature=0`, instructed to return only the command), and executed via `eval` after your confirmation. Adding a capability = one mode function in the product layer (its own prompt and output policy) reusing the harness transport and context — `a ask` is the first example.
 
 ## Development
 

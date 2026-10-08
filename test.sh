@@ -8,6 +8,12 @@ REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PASS=0
 FAIL=0
 
+# 与本机真实配置隔离：固定不存在的配置文件并清掉继承的配置变量，
+# 否则 ~/.config/agent-cli-bash/config 里的 A_API_KEY 等会干扰用例（如 401 测试）
+export A_CONFIG_FILE=/nonexistent
+unset A_API_KEY A_PROVIDER A_BASE_URL A_MODEL A_MAX_RETRIES A_MAX_CONTEXT_CHARS A_TIMEOUT A_DIR_ENTRIES \
+      DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_MODEL 2>/dev/null || true
+
 ok()   { PASS=$((PASS + 1)); echo "  ✔ $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  ✘ $1"; }
 check() { # check <描述> <实际> <期望>
@@ -43,6 +49,7 @@ class H(BaseHTTPRequestHandler):
         if "BADKEY" in auth or "AUTHFAIL" in last_user:
             code, obj = 401, {"error": {"message": "Authentication Fails (no such user)"}}
         else:
+            nofence = False
             if "RATELIMIT" in last_user:
                 self.send_response(429)
                 self.send_header("retry-after", "1")
@@ -95,6 +102,13 @@ class H(BaseHTTPRequestHandler):
                     cmd = "ASK: 目录里有多个候选文件，要处理哪一个？（回答里包含 ANSWER42 即可通过）"
             elif "ASKLOOP" in allc:
                 cmd = "ASK: 还是没看懂，能再说详细一点吗？"
+            elif "ASKMARK" in last_user:
+                # ask 模式: 校验 max_tokens=1024、消息用「问题:」前缀、且不携带 run 模式会话（隔离）
+                if body.get("max_tokens") != 1024 or "FIRST_MARKER_CMD" in allc or "问题:" not in last_user:
+                    cmd = "回答WRONG"
+                else:
+                    cmd = "回答OK\n第二行含围栏:\n```bash\nls\n```"
+                nofence = True
             elif "TRIM0" in last_user:
                 cmd = "echo PAD_OLD_" + "P" * 300
             elif "TRIM1" in last_user:
@@ -112,7 +126,7 @@ class H(BaseHTTPRequestHandler):
                 cmd = "echo CTX_OK" if "FIRST_MARKER_CMD" in allc else "echo SECOND_NO_CTX"
             else:
                 cmd = 'echo "mock 命令 <fence>"'
-            full = "```bash\n" + cmd + "\n```"
+            full = cmd if nofence else ("```bash\n" + cmd + "\n```")
             # SSE 流式：按 5 字节小块发送（块尾常为换行），验证增量拼接不丢换行
             chunks = [full[i:i + 5] for i in range(0, len(full), 5)]
             self.send_response(200)
@@ -403,6 +417,63 @@ if command -v expect >/dev/null 2>&1; then
     check "向导后权限 600" "$(ls -l "$cfgw" 2>/dev/null | awk '{print $1}' | sed 's/[@+]$//')" "-rw-------"
     rm -rf "$tmpd2"
 fi
+
+echo "== 3.9 harness 拆分与 a ask 模式 =="
+# 双壳 + 异地 cwd 加载（lib/ 由 a.sh 定位自身目录后 source）
+out=$(cd /tmp && zsh -c ". '$REPO_DIR/a.sh'; a --version" 2>/dev/null)
+if printf '%s' "$out" | grep -q '^agent-cli-bash '; then
+    ok "zsh 异地 cwd 加载 harness"
+else
+    fail "zsh 异地 cwd 加载 harness (实际: $out)"
+fi
+out=$(cd /tmp && bash -c "source '$REPO_DIR/a.sh'; a --version" 2>/dev/null)
+if printf '%s' "$out" | grep -q '^agent-cli-bash '; then
+    ok "bash 异地 cwd 加载 harness"
+else
+    fail "bash 异地 cwd 加载 harness (实际: $out)"
+fi
+out=$(cd "$REPO_DIR" && zsh -c '. ./a.sh; a --version' 2>/dev/null)
+if printf '%s' "$out" | grep -q '^agent-cli-bash '; then
+    ok "相对路径 source 加载"
+else
+    fail "相对路径 source 加载 (实际: $out)"
+fi
+
+# a ask: 原样输出（含围栏不清洗）、max_tokens=1024、与 run 会话隔离
+expected_ask='回答OK
+第二行含围栏:
+```bash
+ls
+```'
+out=$(env DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL" \
+    zsh -c "source '$REPO_DIR/a.sh'; a ask 'ASKMARK 测试'" 2>/dev/null)
+check "zsh a ask 原样输出（含围栏）" "$out" "$expected_ask"
+
+out=$(env DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL" \
+    bash -c "source '$REPO_DIR/a.sh'; a ask 'ASKMARK 测试'" 2>/dev/null)
+check "bash a ask 原样输出" "$out" "$expected_ask"
+
+out=$(env DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL" \
+    zsh -c "source '$REPO_DIR/a.sh'; a -p 'FIRST 请求' >/dev/null 2>&1; a ask 'ASKMARK 问答'; a -p 'SECOND 请求'" 2>/dev/null)
+check "ask 不带 run 会话且 run 上下文不受影响" "$out" "$expected_ask
+echo CTX_OK"
+
+# a -c 清空全部模式；--show 分模式展示
+out=$(env DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL" \
+    zsh -c "source '$REPO_DIR/a.sh'; a -p 'FIRST 请求' >/dev/null 2>&1; a ask 'ASKMARK 问答' >/dev/null 2>&1; a -c; a --show" 2>/dev/null)
+check "a -c 清空全部模式" "$out" "（当前会话暂无对话上下文）"
+
+out=$(env DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL" \
+    zsh -c "source '$REPO_DIR/a.sh'; a -p 'FIRST 请求' >/dev/null 2>&1; a ask 'ASKMARK 问答' >/dev/null 2>&1; a --show" 2>/dev/null)
+if printf '%s' "$out" | grep -q '\[run\]' && printf '%s' "$out" | grep -q '\[ask\]'; then
+    ok "--show 分模式展示"
+else
+    fail "--show 分模式展示 (实际: $out)"
+fi
+
+out=$(printf '问下这段日志的意思 ASKMARK\n' | env DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL" \
+    zsh -c "source '$REPO_DIR/a.sh'; a ask" 2>/dev/null)
+check "ask 管道输入可省略文字描述" "$out" "$expected_ask"
 
 echo "== 4. 错误路径 =="
 rc=0
