@@ -98,7 +98,7 @@ Key safety: the config file is automatically tightened to 600 permissions (owner
 
 Confirmation prompt `Execute? [y=yes n=no i=ignore]`: `y` runs it; `n` or Enter declines with exit code 130 (an explicit refusal you can catch with `||` in scripts); `i` skips it with exit code 0. Executed commands are written to shell history — press ↑ to get them back.
 
-**Multi-step commands are confirmed line by line**: when the AI returns multiple lines (a sequence of steps), nothing runs in one shot — each step is shown and decided individually:
+**Multi-step commands are confirmed step by step**: when the AI returns multiple lines (a sequence of steps), nothing runs in one shot — each step is shown and decided individually. Steps are split on complete shell structures: multi-line `for`/`while`/`if`/`case`/function bodies, heredocs, and trailing `\`/`|` continuations stay together as **one step** instead of being broken into invalid fragments:
 
 ```console
 $ a back up the config and clean up temp files
@@ -156,7 +156,7 @@ $ a --show
           Command: du -ah . | sort -rh | head -5
 ```
 
-When a task needs several sequential steps the AI can return multiple lines, executed one by one after per-step confirmation (see "Multi-step commands" above).
+When a task needs several sequential steps the AI can return multiple lines, split into steps on complete shell structures and executed one by one after per-step confirmation (multi-line blocks stay together as one step — see "Multi-step commands" above).
 
 Notes:
 
@@ -188,7 +188,7 @@ The code is split into a product layer and a harness, with dependencies pointing
 - `a.sh` — entry & product layer: routing of the `a` command, each capability's system prompt and output parsing (command mode strips fences, handles ASK follow-ups), plus the confirmation/execution UX;
 - `lib/a-api.sh` — transport: provider table, config I/O (`a setup`), the SSE streaming client with automatic retries;
 - `lib/a-ctx.sh` — context: per-mode conversation storage and trimming, smart directory-entry selection, git/shell-history gathering;
-- `lib/a-exec.sh` — execution: command risk classification, shell-state detection, the multi-step confirmation executor and terminal interaction helpers.
+- `lib/a-exec.sh` — execution: command structure splitting (multi-line blocks/heredocs stay together as one step), risk classification, shell-state detection, the multi-step confirmation executor and terminal interaction helpers.
 
 At runtime your description plus system/cwd context is sent to the model (`temperature=0`, instructed to return only the command), and executed via `eval` after your confirmation. Adding a capability = one mode function in the product layer (its own prompt and output policy) reusing the harness transport and context — `a ask` is the first example.
 

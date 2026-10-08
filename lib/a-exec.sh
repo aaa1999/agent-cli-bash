@@ -1,5 +1,5 @@
 # a-exec.sh —— L3 执行域（harness）
-# 命令风险评估、shell 状态命令识别与带确认的多步执行。
+# 命令结构切分、风险评估、shell 状态命令识别与带确认的多步执行。
 # 依赖 L2（执行结果经 _a_conv_append 回写会话）；不依赖产品层的任何约定。
 # 由 a.sh 在加载时 source，不单独使用。
 
@@ -45,25 +45,160 @@ _a_prompt_answer() { # _a_prompt_answer <提示文本(不含换行)>
     return 1
 }
 
-# 多步确认执行: 把 <cmd> 按行拆成步骤，逐步显示风险并询问 y/n/i；
+# 把多行命令切成"完整 shell 结构"的步骤，跨行结构不被拆坏:
+#   - 块结构: for/while/until/select...done、if...fi、case...esac、{ }、( )、函数体
+#   - heredoc: <<EOF / <<-'EOF' 体整段归入起始行（<<< here-string 不算）
+#   - 续行: 行尾反斜杠、未闭合引号、行尾 | / && / ||
+# 逐字符扫描（带引号/转义/注释状态），关键字只在其命令位置生效，case 内不计圆括号
+# （避免模式 foo) 误减深度）。尽力而为: 输入未闭合时剩余行并入最后一个步骤，
+# 交给 eval 如实报语法错误。输出: 各步骤以 \036 分隔，无换行尾。
+_a_split_steps() {
+    awk '
+    function emit(s) { if (s ~ /[^ \t]/) printf "%s\036", s }
+    function flush_word() {
+        if (word == "") return
+        if (wpos) {
+            if (word == "if" || word == "for" || word == "while" || word == "until" \
+             || word == "select" || word == "case") {
+                kw++
+                if (word == "case") cdep++
+            } else if (word == "fi" || word == "done") {
+                if (kw > 0) kw--
+            } else if (word == "esac") {
+                if (kw > 0) kw--
+                if (cdep > 0) cdep--
+            }
+        }
+        lastw = word
+        if (fnp > 0) fnp--
+        word = ""; wpos = 0
+    }
+    BEGIN {
+        kw = 0; par = 0; br = 0; cdep = 0; q = ""; esc = 0
+        hd_n = 0; buf = ""; hd_cont = 0; lastw = ""; fnp = 0
+        sq = sprintf("%c", 39)                       # 单引号，避免写进本程序文本
+        stop = " \t;&|<>();#\"\\\\" sq                # heredoc 裸标签的结束字符集
+    }
+    {
+        line = $0
+        # heredoc 体内: 原样收集，直到命中终止符行（<<- 剥前导空白后比较）
+        if (hd_n > 0) {
+            buf = buf == "" ? line : buf "\n" line
+            t = line
+            if (hd_strip[1]) sub(/^[ \t]+/, "", t)
+            if (t == hd_tag[1]) {
+                for (k = 1; k < hd_n; k++) { hd_tag[k] = hd_tag[k+1]; hd_strip[k] = hd_strip[k+1] }
+                delete hd_tag[hd_n]; delete hd_strip[hd_n]
+                hd_n--
+                if (hd_n == 0 && !hd_cont) { emit(buf); buf = "" }
+            }
+            next
+        }
+        # 步骤间隙的空行/纯注释行丢弃（结构内部的空行不算间隙）
+        if (buf == "" && kw + par + br == 0 && line ~ /^[ \t]*($|#)/) next
+
+        n = length(line)
+        i = 1; word = ""; wpos = 1; cmdpos = 1
+        lastc = ""; last2 = ""; tbs = 0
+        while (i <= n) {
+            c = substr(line, i, 1)
+            if (q != "") {                            # 引号内: 只找闭合引号（双引号内 \ 转义）
+                if (q == "\"" && c == "\\") { i += 2; continue }
+                if (c == q) { q = ""; last2 = lastc c; lastc = c }
+                i++
+                continue
+            }
+            if (esc) {                                # 被转义的元字符按字面并入词
+                if (word == "") wpos = cmdpos
+                word = word "W"
+                esc = 0; i++
+                continue
+            }
+            if (c == "\\") {
+                if (i == n) { tbs = 1; break }        # 行尾反斜杠 → 续行
+                esc = 1; i++
+                continue
+            }
+            if (c == sq || c == "\"") {
+                flush_word()
+                q = c; last2 = lastc c; lastc = c
+                i++
+                continue
+            }
+            if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[ \t]/)) break
+            if (c == " " || c == "\t") { flush_word(); i++; continue }
+            last2 = lastc c; lastc = c
+            if (c == ";" || c == "&" || c == "|") { flush_word(); cmdpos = 1; i++; continue }
+            if (c == "(") { flush_word(); if (cdep == 0) par++; cmdpos = 1; i++; continue }
+            if (c == ")") { flush_word(); if (cdep == 0 && par > 0) par--; cmdpos = 1; i++; continue }
+            if (c == "{") { flush_word(); if (cmdpos || fnp > 0) br++; cmdpos = 1; i++; continue }
+            if (c == "}") { flush_word(); if (cmdpos && br > 0) br--; cmdpos = 1; i++; continue }
+            if (c == "<" && substr(line, i, 2) == "<<") {
+                flush_word()
+                if (substr(line, i, 3) == "<<<") { i += 3; continue }   # here-string 不算
+                st = 0
+                if (substr(line, i, 3) == "<<-") { st = 1; j = i + 3 } else j = i + 2
+                while (j <= n && substr(line, j, 1) ~ /[ \t]/) j++
+                qq = ""
+                if (j <= n) {
+                    fc = substr(line, j, 1)
+                    if (fc == "\\") { j++; qq = "" }
+                    else if (fc == sq || fc == "\"") { qq = fc; j++ }
+                }
+                t = ""
+                while (j <= n) {
+                    tc = substr(line, j, 1)
+                    if (qq != "") {
+                        if (tc == qq) { j++; break }   # 连闭合引号一起跳过
+                        t = t tc
+                    } else {
+                        if (index(stop, tc) > 0) break
+                        t = t tc
+                    }
+                    j++
+                }
+                # 标签须为纯词字符（防 $((1<<2)) 之类误判），且不在圆括号内
+                if (t != "" && length(t) <= 64 && t ~ /^[A-Za-z0-9_.-]+$/ && par == 0) {
+                    hd_n++; hd_tag[hd_n] = t; hd_strip[hd_n] = st
+                }
+                i = j
+                continue
+            }
+            if (word == "") wpos = cmdpos
+            word = word c
+            cmdpos = 0
+            i++
+        }
+        flush_word()
+        buf = buf == "" ? line : buf "\n" line
+        if (hd_n > 0) {                               # 体从下一行开始；记录体外的结构状态
+            hd_cont = (kw + par + br > 0 || q != "" || tbs)
+            next
+        }
+        if (kw + par + br > 0 || q != "" || tbs || lastc == "|" || last2 == "&&") next
+        emit(buf); buf = ""
+    }
+    END { emit(buf) }
+    '
+}
+
+# 多步确认执行: 把 <cmd> 按完整 shell 结构切成步骤（_a_split_steps，跨行的
+# for/heredoc 等作为一步），逐步显示风险并询问 y/n/i；
 # 高危命令即使 -y 也强制确认，无终端一律拒绝；shell 状态命令在当前 shell 执行。
 # 执行结果摘要（R 消息）回写到 <mode> 的会话；返回最后一步退出码，用户终止返回 130。
 _a_exec_steps() { # _a_exec_steps <mode> <auto_yes> <cmd>
     local mode=$1 auto_yes=$2 cmd=$3
-    local remaining=$cmd step risk reply
-    local total n=0 executed=0 skipped=0 stopped_at=0 rc=0 state_executed=0
+    local risk reply step
+    local -a steps
+    steps=()
+    while IFS= read -rd $'\036' step; do
+        [[ -n ${step//[[:space:]]/} ]] && steps+=("$step")
+    done < <(printf '%s\n' "$cmd" | _a_split_steps)
+    local total=${#steps[@]} n=0 executed=0 skipped=0 stopped_at=0 rc=0 state_executed=0
     local out_file out_tail
-    total=$(printf '%s\n' "$cmd" | awk 'NF' | wc -l | tr -d ' ')
     out_file=$(mktemp "${TMPDIR:-/tmp}/a-out.XXXXXX")
 
-    while [[ -n $remaining ]]; do
-        step=${remaining%%$'\n'*}
-        if [[ $step == "$remaining" ]]; then
-            remaining=
-        else
-            remaining=${remaining#*$'\n'}
-        fi
-        [[ -z ${step//[[:space:]]/} ]] && continue
+    for step in "${steps[@]}"; do
         n=$((n + 1))
 
         if [[ $total -gt 1 ]]; then

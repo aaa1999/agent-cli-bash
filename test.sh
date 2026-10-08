@@ -75,6 +75,12 @@ class H(BaseHTTPRequestHandler):
                 cmd = "(exit 7)"
             elif "MULTI" in last_user:
                 cmd = "echo STEP_A\necho STEP_B\necho STEP_C"
+            elif "BLOCKFOR" in last_user:
+                cmd = "for i in 1 2 3; do\n  echo \"BFC_$i\"\ndone"
+            elif "BLOCKHD" in last_user:
+                cmd = "cat > /tmp/a-hd-test.txt << 'EOF'\nheredoc line1\nheredoc line2\nEOF"
+            elif "BLOCKMIX" in last_user:
+                cmd = "for f in a b; do\n  echo \"MX_$f\"\ndone\necho MX_TAIL"
             elif "DANGEROUS" in last_user:
                 cmd = "sudo rm -rf /tmp/a-bad-demo"
             elif "PIPE_DATA_MARKER" in last_user:
@@ -583,6 +589,114 @@ check "重定向覆盖判为 caution" "$(risk 'echo hi > out.txt')" "caution"
 check "git push 判为 caution" "$(risk 'git push origin main')" "caution"
 check "追加写入不警示" "$(risk 'echo hi >> log')" ""
 check "只读命令不警示" "$(risk 'ls -la | grep foo')" ""
+
+echo "== 5.3 跨行结构切分与整体执行 =="
+# 切分单测: 各步骤以 %% 连接（步骤内部保留换行），直接 source 后调 harness 函数
+split_join() { # split_join <命令文本>
+    SPLIT_IN="$1" zsh -c "source '$REPO_DIR/a.sh'; printf '%s\n' \"\$SPLIT_IN\" | _a_split_steps" 2>/dev/null \
+        | awk 'BEGIN{RS="\036"; sep=""} NF{printf "%s%s", sep, $0; sep="%%"}'
+}
+
+check "for 块整体一步" "$(split_join 'for i in 1 2 3; do
+  echo "N_$i"
+done
+echo after')" 'for i in 1 2 3; do
+  echo "N_$i"
+done%%echo after'
+
+check "heredoc 引号标签整体一步" "$(split_join "cat > f.txt << 'EOF'
+hello
+world
+EOF
+echo done")" "cat > f.txt << 'EOF'
+hello
+world
+EOF%%echo done"
+
+check "if/elif/else 整体一步" "$(split_join 'if [ -f x ]; then
+  echo yes
+elif [ -d x ]; then
+  echo dir
+else
+  echo no
+fi
+echo end')" 'if [ -f x ]; then
+  echo yes
+elif [ -d x ]; then
+  echo dir
+else
+  echo no
+fi%%echo end'
+
+check "case 块的模式括号不误判" "$(split_join 'case $1 in
+  start)
+    echo up
+    ;;
+  stop)
+    echo down
+    ;;
+esac
+echo end')" 'case $1 in
+  start)
+    echo up
+    ;;
+  stop)
+    echo down
+    ;;
+esac%%echo end'
+
+check "函数定义整体一步" "$(split_join 'greet() {
+  echo hi
+}
+greet')" 'greet() {
+  echo hi
+}%%greet'
+
+check "行尾管道续行并入" "$(split_join 'ls -la |
+  grep foo
+echo next')" 'ls -la |
+  grep foo%%echo next'
+
+check "行尾反斜杠续行并入" "$(split_join 'echo long \
+  line
+echo next')" 'echo long \
+  line%%echo next'
+
+check "引号内关键字不误判" "$(split_join 'echo "for while fi done"
+ls')" 'echo "for while fi done"%%ls'
+
+check "单行 for 不误合" "$(split_join 'for i in a b; do echo $i; done
+echo next')" 'for i in a b; do echo $i; done%%echo next'
+
+check "here-string 不当 heredoc" "$(split_join 'grep x <<< "hello"
+echo ok')" 'grep x <<< "hello"%%echo ok'
+
+check "算术位移不误判 heredoc" "$(split_join 'echo $(( 1 << 2 ))
+echo ok')" 'echo $(( 1 << 2 ))%%echo ok'
+
+check "未闭合结构并入最后一步" "$(split_join 'for i in 1 2; do
+echo x')" 'for i in 1 2; do
+echo x'
+
+check "步骤间隙空行/注释丢弃" "$(split_join 'echo a
+
+# 注释
+echo b')" 'echo a%%echo b'
+
+# 全链路: mock 返回跨行结构，-y 执行验证行为正确
+out=$(run_a zsh "-y 'BLOCKFOR 请求'")
+check "zsh -y for 循环块整体执行" "$out" $'BFC_1\nBFC_2\nBFC_3'
+
+out=$(run_a bash "-y 'BLOCKFOR 请求'")
+check "bash -y for 循环块整体执行" "$out" $'BFC_1\nBFC_2\nBFC_3'
+
+rm -f /tmp/a-hd-test.txt
+run_a bash "-y 'BLOCKHD 请求'" >/dev/null
+check "heredoc 块写入文件完整" "$(cat /tmp/a-hd-test.txt 2>/dev/null)" $'heredoc line1\nheredoc line2'
+rm -f /tmp/a-hd-test.txt
+
+out=$(run_a zsh "-y 'BLOCKMIX 请求'")
+check "循环块与后续步骤顺序执行" "$out" $'MX_a\nMX_b\nMX_TAIL'
 
 echo "== 6. install.sh 安装/卸载 =="
 TMPHOME=$(mktemp -d)

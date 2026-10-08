@@ -86,6 +86,12 @@ class H(BaseHTTPRequestHandler):
                 cmd = "$global:LASTEXITCODE = 7"
             elif "MULTI" in last_user:
                 cmd = "Write-Output STEP_A\nWrite-Output STEP_B\nWrite-Output STEP_C"
+            elif "BLOCKFOR" in last_user:
+                cmd = "foreach ($i in 1..3) {\n  Write-Output \"BFC_$i\"\n}"
+            elif "BLOCKHD" in last_user:
+                cmd = "@'\nheredoc line1\nheredoc line2\n'@ | Set-Content -LiteralPath $env:A_HD_TEST"
+            elif "BLOCKMIX" in last_user:
+                cmd = "foreach ($f in 'a','b') {\n  Write-Output \"MX_$f\"\n}\nWrite-Output MX_TAIL"
             elif "DANGEROUS" in last_user:
                 cmd = "sudo rm -rf /tmp/a-bad-demo"
             elif "PIPE_DATA_MARKER" in last_user:
@@ -415,6 +421,90 @@ echo hi
     foreach ($c in $cases) {
         check "risk: $($c[0])" (_a_risk $c[0]) $c[1]
     }
+
+    Write-Host "== 5.3 跨行结构切分与整体执行 =="
+    # 切分单测: 各步骤以 %% 连接（步骤内部保留换行）
+    function split_join([string]$Cmd) { (_a_split_steps $Cmd) -join '%%' }
+    $si1 = @'
+foreach ($i in 1..3) {
+  Write-Output "BFC_$i"
+}
+Write-Output after
+'@
+    $se1 = @'
+foreach ($i in 1..3) {
+  Write-Output "BFC_$i"
+}%%Write-Output after
+'@
+    check 'foreach 块整体一步' (split_join $si1) $se1
+
+    $si2 = (@('$s = @''', 'heredoc line1', 'heredoc line2', "'@", 'Write-Output after') -join "`n")
+    $se2 = (@('$s = @''', 'heredoc line1', 'heredoc line2', "'@") -join "`n") + '%%Write-Output after'
+    check 'here-string 整体一步' (split_join $si2) $se2
+
+    $si3 = @'
+if (Test-Path x) {
+  Write-Output yes
+} elseif (Test-Path y) {
+  Write-Output maybe
+} else {
+  Write-Output no
+}
+Write-Output end
+'@
+    $se3 = @'
+if (Test-Path x) {
+  Write-Output yes
+} elseif (Test-Path y) {
+  Write-Output maybe
+} else {
+  Write-Output no
+}%%Write-Output end
+'@
+    check 'if/elseif/else 整体一步' (split_join $si3) $se3
+
+    $si4 = @'
+Get-ChildItem |
+  Sort-Object LastWriteTime
+Write-Host `
+  continued
+Write-Output end
+'@
+    $se4 = (@('Get-ChildItem |', '  Sort-Object LastWriteTime') -join "`n") + '%%' +
+        (@('Write-Host `', '  continued') -join "`n") + '%%Write-Output end'
+    check '行尾管道/反引号续行并入' (split_join $si4) $se4
+
+    check '引号内花括号括号不误判' (split_join 'Write-Host "brace } paren ( done"
+Write-Output ok') 'Write-Host "brace } paren ( done"%%Write-Output ok'
+
+    check '单行 foreach 不误合' (split_join 'foreach ($i in 1..2) { Write-Output $i }
+Write-Output next') 'foreach ($i in 1..2) { Write-Output $i }%%Write-Output next'
+
+    check '未闭合结构并入最后一步' (split_join 'foreach ($x in 1..2) {
+  Write-Output $x') 'foreach ($x in 1..2) {
+  Write-Output $x'
+
+    check '块注释跨行并入' (split_join '<# 说明
+  注释 #>
+Write-Output ok') '<# 说明
+  注释 #>%%Write-Output ok'
+
+    # 全链路: mock 返回跨行结构，-y 执行验证行为正确
+    $r = run_a_stdin 'a -y ''BLOCKFOR 请求'''
+    $bfc = @($r.Out -split "`r?`n" | Where-Object { $_ -match '^BFC_[123]$' }) -join ','
+    check 'for 循环块整体执行' $bfc 'BFC_1,BFC_2,BFC_3'
+
+    $env:A_HD_TEST = Join-Path $TestTmp 'hd-test.txt'
+    Remove-Item -LiteralPath $env:A_HD_TEST -ErrorAction SilentlyContinue
+    $null = run_a_stdin 'a -y ''BLOCKHD 请求'''
+    $hd = (@(Get-Content -LiteralPath $env:A_HD_TEST -ErrorAction SilentlyContinue) -join "`n")
+    check 'here-string 块写入文件完整' $hd "heredoc line1`nheredoc line2"
+    Remove-Item -LiteralPath $env:A_HD_TEST -ErrorAction SilentlyContinue
+    Remove-Item env:A_HD_TEST -ErrorAction SilentlyContinue
+
+    $r = run_a_stdin 'a -y ''BLOCKMIX 请求'''
+    $mx = @($r.Out -split "`r?`n" | Where-Object { $_ -match '^MX_' }) -join ','
+    check '循环块与后续步骤顺序执行' $mx 'MX_a,MX_b,MX_TAIL'
 
     Write-Host "== 6. setup 工具函数与配置合并 =="
     check '密钥掩码保留首尾' (_a_mask_key 'sk-abcdefgh1234') 'sk-a***1234'

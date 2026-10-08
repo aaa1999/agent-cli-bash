@@ -72,7 +72,8 @@ a —— 自然语言转 PowerShell 命令（agent-cli-bash · Windows 版）
 执行结果码写入 $A_LAST_RC（PowerShell 函数没有独立退出码）。
 
 多步执行:
-  AI 返回多行命令(多个连续步骤)时逐行确认，每一步都由你决策:
+  AI 返回多行命令时按完整 PowerShell 结构切成步骤(跨行的 foreach/if/函数体、
+  here-string、反引号续行等作为一步整体)，逐步确认，每一步都由你决策:
   y=执行此步并继续  n=终止剩余步骤  i=跳过此步继续后面的步骤
   高危/高权限命令(红色显示)必须逐条确认，即使 -y 也不会自动执行；
   写操作(黄色显示)有 ⚡ 提示。无终端环境下高危命令一律拒绝。
@@ -263,7 +264,7 @@ function _a_run([string]$Query, [string]$StdinData, [int]$PrintOnly, [int]$AutoY
     # 写入会话历史，方便 ↑/F8 找回
     try { Add-History -InputObject ([pscustomobject]@{ CommandLine = $cmd }) } catch { }
 
-    # 多步逐行确认执行（风险提示、y/n/i、130 语义、R 消息回写、$A_LAST_RC 都在其中）
+    # 多步按结构切分确认执行（风险提示、y/n/i、130 语义、R 消息回写、$A_LAST_RC 都在其中）
     _a_exec_steps 'run' $AutoYes $cmd
 }
 

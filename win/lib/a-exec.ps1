@@ -1,5 +1,5 @@
 ﻿# a-exec.ps1 —— L3 执行域（harness，PowerShell 版）
-# 命令风险评估、会话状态命令识别与带确认的多步执行。
+# 命令结构切分、风险评估、会话状态命令识别与带确认的多步执行。
 # 依赖 L2（执行结果经 _a_conv_append 回写会话）；不依赖产品层的任何约定。
 # 由 a.ps1 在加载时 dot-source，不单独使用。
 #
@@ -72,12 +72,92 @@ function _a_prompt_answer([string]$Prompt) {
     }
 }
 
-# 多步确认执行: 把 <cmd> 按行拆成步骤，逐步显示风险并询问 y/n/i；
+# 把多行命令切成"完整 PowerShell 结构"的步骤，跨行结构不被拆坏:
+#   - 块结构: if/foreach/while/switch/try/函数体的 { }、分组 ( )、哈希表 @{ }
+#   - here-string: @" ... "@ / @' ... '@（终止符位于行首）
+#   - 续行: 行尾反引号、未闭合引号、块注释 <# ... #>、行尾 | / && / ||
+# 引号感知（'' 与 "" 自转义、双引号内反引号转义）；未闭合输入并入最后一步，
+# 交给 Invoke-Expression 如实报错。返回各步骤（原文）的数组。
+function _a_split_steps([string]$Cmd) {
+    $out = New-Object System.Collections.Generic.List[string]
+    $depth = 0                       # 未闭合的 { 与 ( 计数
+    $q = [char]0                     # 未闭合引号（' 或 "）
+    $here = ''                       # here-string 终止符（"@ 或 '@），空 = 不在体内
+    $bcmt = $false                   # 块注释 <# ... #> 内
+    $buf = ''
+    foreach ($line in ($Cmd -split "`r?`n")) {
+        $startAt = 0
+        $scan = $false
+        if ($here -ne '') {
+            if ($line.StartsWith($here)) { $here = ''; $startAt = 2; $scan = $true }   # 终止行，其后内容恢复扫描
+        } elseif ($bcmt) {
+            $end = $line.IndexOf('#>')
+            if ($end -ge 0) { $bcmt = $false; $startAt = $end + 2; $scan = $true }
+        } else {
+            $scan = $true
+        }
+
+        if (-not $scan) {
+            # here-string 体 / 块注释中间行: 原样并入
+            if ($buf -eq '') { $buf = $line } else { $buf = "$buf`n$line" }
+            continue
+        }
+
+        # 步骤间隙的空行/纯注释行丢弃（结构内部的空行不算间隙）
+        $t = $line.TrimStart()
+        if ($buf -eq '' -and $depth -eq 0 -and $here -eq '' -and -not $bcmt -and ($t -eq '' -or $t.StartsWith('#'))) { continue }
+
+        $n = $line.Length
+        $lastc = [char]0; $last2 = ''
+        $tbt = $false
+        for ($i = $startAt; $i -lt $n; $i++) {
+            $c = $line[$i]
+            if ($q -ne [char]0) {                       # 引号内: 找闭合（'' / "" 自转义；" 内 ` 转义）
+                if ($q -eq [char]34 -and $c -eq [char]96) { $i++; continue }
+                if ($c -eq $q -and $i + 1 -lt $n -and $line[$i + 1] -eq $q) { $i++; continue }
+                if ($c -eq $q) { $q = [char]0; $last2 = "$lastc$c"; $lastc = $c }
+                continue
+            }
+            if ($c -eq [char]96) {                      # 反引号转义下一字符；行尾即续行
+                if ($i -eq $n - 1) { $tbt = $true; break }
+                $i++
+                continue
+            }
+            if ($c -eq [char]39 -or $c -eq [char]34) { $q = $c; $last2 = "$lastc$c"; $lastc = $c; continue }
+            if ($c -eq '@' -and $i + 1 -lt $n -and ($line[$i + 1] -eq [char]39 -or $line[$i + 1] -eq [char]34)) {
+                $here = if ($line[$i + 1] -eq [char]39) { "'@" } else { '"@' }
+                $i++
+                continue
+            }
+            if ($c -eq '<' -and $i + 1 -lt $n -and $line[$i + 1] -eq '#') {    # 块注释
+                if ($line.IndexOf('#>', $i + 2) -lt 0) { $bcmt = $true }
+                break
+            }
+            if ($c -eq '#' -and ($i -eq 0 -or [char]::IsWhiteSpace($line[$i - 1]))) { break }
+            if ($c -eq ' ' -or $c -eq "`t") { continue }
+            $last2 = "$lastc$c"; $lastc = $c
+            if ($c -eq '{' -or $c -eq '(') { $depth++ }
+            elseif ($c -eq '}' -or $c -eq ')') { if ($depth -gt 0) { $depth-- } }
+        }
+        if ($buf -eq '') { $buf = $line } else { $buf = "$buf`n$line" }
+        $incomplete = ($depth -gt 0) -or ($q -ne [char]0) -or ($here -ne '') -or $bcmt -or $tbt `
+            -or ($lastc -eq '|') -or ($last2 -eq '&&') -or ($last2 -eq '||')
+        if (-not $incomplete) {
+            if ($buf.Trim() -ne '') { $out.Add($buf) }
+            $buf = ''
+        }
+    }
+    if ($buf.Trim() -ne '') { $out.Add($buf) }
+    return $out
+}
+
+# 多步确认执行: 把 <cmd> 按完整 PowerShell 结构切成步骤（_a_split_steps，跨行的
+# foreach/here-string 等作为一步），逐步显示风险并询问 y/n/i；
 # 高危命令即使 -y 也强制确认，无终端一律拒绝；会话状态命令直行不捕获。
 # 执行结果摘要（R 消息）回写到 <mode> 的会话；最后退出码写入 $global:A_LAST_RC，
 # 用户终止时为 130。（PowerShell 函数没有独立退出码，a 的调用方以 $global:A_LAST_RC 取值）
 function _a_exec_steps([string]$Mode, [int]$AutoYes, [string]$Cmd) {
-    $steps = @($Cmd -split "`r?`n" | Where-Object { $_.Trim() -ne '' })
+    $steps = @(_a_split_steps $Cmd)
     $total = $steps.Count
     $n = 0; $executed = 0; $skipped = 0; $stopped_at = 0; $rc = 0; $state_executed = 0
     $out_file = _a_mktemp
