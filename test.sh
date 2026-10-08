@@ -84,6 +84,17 @@ class H(BaseHTTPRequestHandler):
                 want_git = "NOGIT" not in last_user
                 ok = ("当前目录:" in allc) and ("目录内容" in allc) and (("git:" in allc) == want_git)
                 cmd = "echo ENVCTX_OK" if ok else "echo ENVCTX_MISSING"
+            elif "DIRCTX" in last_user:
+                ok = ("linuxmint-22.3-cinnamon-64bit-hwe-7.0.iso" in last_user
+                      and "共 22 项" in last_user and "仅列 15 项" in last_user)
+                cmd = "echo DIRCTX_OK" if ok else "echo DIRCTX_MISS"
+            elif "ASKFLOW" in allc:
+                if "补充:" in last_user and "ANSWER42" in last_user:
+                    cmd = "echo ASKFLOW_DONE"
+                else:
+                    cmd = "ASK: 目录里有多个候选文件，要处理哪一个？（回答里包含 ANSWER42 即可通过）"
+            elif "ASKLOOP" in allc:
+                cmd = "ASK: 还是没看懂，能再说详细一点吗？"
             elif "TRIM0" in last_user:
                 cmd = "echo PAD_OLD_" + "P" * 300
             elif "TRIM1" in last_user:
@@ -263,6 +274,100 @@ out=$(cd "$tmpd" && env DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL" \
     zsh -c "source '$REPO_DIR/a.sh'; a -p 'PWDCTX NOGIT 请求'" 2>/dev/null)
 check "非 git 目录不携带 git 行" "$out" "echo ENVCTX_OK"
 rm -rf "$tmpd"
+
+echo "== 3.7.1 目录条目智能选取 =="
+tmpd=$(mktemp -d)
+# 20 个字母序靠前的旧文件 + 目标 iso（口语"linuxiso"应命中）+ 最新的无关文件
+for i in $(seq -w 1 20); do touch -t 202001010000 "$tmpd/aaa-$i.txt"; done
+touch -t 202401010000 "$tmpd/linuxmint-22.3-cinnamon-64bit-hwe-7.0.iso"
+touch "$tmpd/zz-new.txt"
+
+out=$(cd "$tmpd" && zsh -c "source '$REPO_DIR/a.sh'; _a_env_context '计算linuxiso的sha256'" 2>/dev/null)
+if printf '%s\n' "$out" | grep -q '^linuxmint-22.3-cinnamon-64bit-hwe-7.0.iso$'; then
+    ok "口语缩写命中目标文件（字母序截断下不可见）"
+else
+    fail "口语缩写命中目标文件 (实际: $out)"
+fi
+if printf '%s\n' "$out" | grep -q '共 22 项'; then
+    ok "表头注明总条目数"
+else
+    fail "表头注明总条目数 (实际: $out)"
+fi
+check "只列 15 项" "$(printf '%s\n' "$out" | grep -cE '^(aaa-|linuxmint|zz-new)')" "15"
+check "命中条目排在首位" "$(printf '%s\n' "$out" | grep -E '^(aaa-|linuxmint|zz-new)' | head -1)" \
+    "linuxmint-22.3-cinnamon-64bit-hwe-7.0.iso"
+
+out=$(cd "$tmpd" && bash -c "source '$REPO_DIR/a.sh'; _a_env_context '计算linuxiso的sha256'" 2>/dev/null)
+if printf '%s\n' "$out" | grep -q '^linuxmint-22.3-cinnamon-64bit-hwe-7.0.iso$'; then
+    ok "bash 下同样命中"
+else
+    fail "bash 下同样命中 (实际: $out)"
+fi
+
+out=$(cd "$tmpd" && zsh -c "source '$REPO_DIR/a.sh'; _a_env_context '看看最新下载的东西'" 2>/dev/null)
+check "无词元查询按修改时间补足（最新在前）" \
+    "$(printf '%s\n' "$out" | grep -E '^(aaa-|linuxmint|zz-new)' | head -1)" "zz-new.txt"
+
+out=$(cd "$tmpd" && A_DIR_ENTRIES=5 zsh -c "source '$REPO_DIR/a.sh'; _a_env_context '算linuxiso的'" 2>/dev/null)
+check "A_DIR_ENTRIES=5 只列 5 项" "$(printf '%s\n' "$out" | grep -cE '^(aaa-|linuxmint|zz-new)')" "5"
+out=$(cd "$tmpd" && A_DIR_ENTRIES=0 zsh -c "source '$REPO_DIR/a.sh'; _a_env_context '随便'" 2>/dev/null)
+check "A_DIR_ENTRIES=0 不注入目录内容" "$(printf '%s\n' "$out" | grep -c '目录内容')" "0"
+
+out=$(cd "$tmpd" && env DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL" \
+    zsh -c "source '$REPO_DIR/a.sh'; a -p 'DIRCTX 计算linuxiso的sha256'" 2>/dev/null)
+check "e2e: 发送的消息携带目标文件而非字母序截断" "$out" "echo DIRCTX_OK"
+rm -rf "$tmpd"
+
+echo "== 3.7.2 ASK 反问与补充 =="
+export DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL"
+rc=0
+out=$(zsh -c "source '$REPO_DIR/a.sh'; a -y 'ASKFLOW 请求'" </dev/null 2>&1) || rc=$?
+check "无终端时 ASK 取消并提示" "$rc - $(printf '%s' "$out" | grep -c '无终端可交互')" "1 - 1"
+
+if command -v expect >/dev/null 2>&1; then
+    out=$(A_TEST_CMD="source '$REPO_DIR/a.sh'; a -y 'ASKFLOW 请求'" expect -c '
+        set timeout 8
+        spawn zsh -c $env(A_TEST_CMD)
+        expect "补充信息"
+        send "ANSWER42\r"
+        expect eof
+    ' 2>/dev/null)
+    if printf '%s' "$out" | tr -d '\r' | grep -q '^ASKFLOW_DONE$'; then
+        ok "ASK 补充后同轮重新生成并执行"
+    else
+        fail "ASK 补充后同轮重新生成并执行 (实际: $out)"
+    fi
+
+    rc=0
+    A_TEST_CMD="source '$REPO_DIR/a.sh'; a -y 'ASKFLOW 请求'" expect -c '
+        set timeout 8
+        spawn zsh -c $env(A_TEST_CMD)
+        expect "补充信息"
+        send "\r"
+        expect eof
+        catch wait w
+        exit [lindex $w 3]
+    ' >/dev/null 2>&1 || rc=$?
+    check "空回答取消返回 1" "$rc" "1"
+
+    rc=0
+    out=$(A_TEST_CMD="source '$REPO_DIR/a.sh'; a -y 'ASKLOOP 请求'" expect -c '
+        set timeout 8
+        spawn zsh -c $env(A_TEST_CMD)
+        expect "补充信息"
+        send "x1\r"
+        expect "补充信息"
+        send "x2\r"
+        expect "补充信息"
+        send "x3\r"
+        expect eof
+        catch wait w
+        exit [lindex $w 3]
+    ' 2>/dev/null) || rc=$?
+    check "连续追问达上限返回 1" "$rc - $(printf '%s' "$out" | grep -c '上限')" "1 - 1"
+else
+    echo "  （未安装 expect，跳过 ASK 交互测试）"
+fi
 
 echo "== 3.8 a setup 配置向导 =="
 mask=$(zsh -c "source '$REPO_DIR/a.sh'; _a_mask_key sk-abcdefgh1234" 2>/dev/null)

@@ -56,9 +56,10 @@ A_API_KEY=sk-xxx                 # unified key; if unset, the provider's env var
 # A_MAX_RETRIES=3                # optional, auto retries on network errors / 429/5xx (0 disables)
 # A_MAX_CONTEXT_CHARS=24000      # optional, session context character budget
 # A_TIMEOUT=60                   # optional, per-request timeout in seconds
+# A_DIR_ENTRIES=15               # optional, directory-entry context cap (0 disables); relevant entries first, rest by mtime
 ```
 
-Precedence: environment variables > config file; `A_API_KEY` > provider-specific vars (e.g. `OPENAI_API_KEY`). With only the legacy `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` set, behavior is unchanged from previous versions. `A_MAX_RETRIES` controls automatic retries on network errors and HTTP 429/5xx (default 3, exponential backoff honoring `Retry-After`; 0 disables; client errors like 401 are never retried). `A_TIMEOUT` sets the per-request timeout (default 60 s).
+Precedence: environment variables > config file; `A_API_KEY` > provider-specific vars (e.g. `OPENAI_API_KEY`). With only the legacy `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` set, behavior is unchanged from previous versions. `A_MAX_RETRIES` controls automatic retries on network errors and HTTP 429/5xx (default 3, exponential backoff honoring `Retry-After`; 0 disables; client errors like 401 are never retried). `A_TIMEOUT` sets the per-request timeout (default 60 s). `A_DIR_ENTRIES` caps the directory entries injected as context (default 15, 0 disables).
 
 Key safety: the config file is automatically tightened to 600 permissions (owner-only) both when loaded and when written by `a setup`; request headers are passed to curl via a `-K` temp file, so the key never appears in process arguments (invisible to `ps`).
 
@@ -115,10 +116,12 @@ $ a the first command errored, fix it
 The context sent to the AI each turn includes:
 
 - piped input (the entire stdin when you do `cat error.log | a explain this error`, capped at 8KB);
-- **current environment**: working directory, git branch + uncommitted-change count, and the first 15 directory entries — so relative-path requests like "delete this temp file" don't require guessing;
+- **current environment**: working directory, git branch + uncommitted-change count, and directory entries (cap `A_DIR_ENTRIES`, default 15) — when the directory is large, entries are not blindly truncated in alphabetical order: **entries relevant to your request come first** ("sha256 of linuxiso" surfaces `linuxmint-*.iso` at the top), the rest fill by mtime newest-first, and the header shows the total count;
 - previous requests and AI-generated commands from this session (even the ones you declined);
 - **exit code and output tail** (last 40 lines) of executed commands — that's why "fix that error" works;
 - the last 6 shell history entries you typed by hand (excluding `a` itself), so the AI knows what you've been doing.
+
+**The AI never invents file names — it asks**: the system prompt requires exact names from the context to interpret your loose wording. If the file you refer to is still ambiguous or absent, the AI asks back with a `❓` question (e.g. "multiple iso files here — which one's sha256 do you want?"); type your clarification and the command is **regenerated in the same turn** (at most 3 follow-ups), or press Enter to cancel. Without a terminal (scripts/CI) it prints the question and exits safely without executing anything.
 
 Context is isolated per shell session (separate terminal windows don't interfere); `a -c` clears it anytime. Size is doubly bounded: at most 40 messages, and within a character budget (`A_MAX_CONTEXT_CHARS`, default 24000 ≈ 12K tokens) **whole turns** are kept from newest to oldest (request + command + result stay together, never split); turns beyond the budget are dropped, the latest turn is always kept.
 

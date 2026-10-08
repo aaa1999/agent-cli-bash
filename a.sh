@@ -7,7 +7,9 @@
 #   a -c                清空本会话的多轮对话上下文
 #
 # 多轮: 同一 shell 会话内，之前的问答、生成的命令、执行结果（退出码+输出尾部）、
-#       当前目录/git 状态以及最近的终端历史会自动作为上下文发给 AI，支持"报错了帮我修"等追问。
+#       当前目录/git 状态、目录条目（与请求相关的优先入选）以及最近的终端历史
+#       会自动作为上下文发给 AI，支持"报错了帮我修"等追问。
+#       AI 不得编造文件名: 所指目标不明确时以 ASK: 反问，按提示补充信息即可同轮继续。
 #
 # 兼容 bash 与 zsh。配置读取顺序: 环境变量 > ~/.config/agent-cli-bash/config
 # 支持 A_PROVIDER / A_API_KEY / A_BASE_URL / A_MODEL（`a providers` 查看内置提供商）
@@ -60,6 +62,7 @@ _a_load_config() {
             A_MAX_RETRIES)       [[ -n ${A_MAX_RETRIES:-}       ]] || A_MAX_RETRIES=$val ;;
             A_MAX_CONTEXT_CHARS) [[ -n ${A_MAX_CONTEXT_CHARS:-} ]] || A_MAX_CONTEXT_CHARS=$val ;;
             A_TIMEOUT)           [[ -n ${A_TIMEOUT:-}           ]] || A_TIMEOUT=$val ;;
+            A_DIR_ENTRIES)       [[ -n ${A_DIR_ENTRIES:-}       ]] || A_DIR_ENTRIES=$val ;;
             DEEPSEEK_API_KEY)  [[ -n ${DEEPSEEK_API_KEY:-}  ]] || DEEPSEEK_API_KEY=$val ;;
             DEEPSEEK_BASE_URL) [[ -n ${DEEPSEEK_BASE_URL:-} ]] || DEEPSEEK_BASE_URL=$val ;;
             DEEPSEEK_MODEL)    [[ -n ${DEEPSEEK_MODEL:-}    ]] || DEEPSEEK_MODEL=$val ;;
@@ -350,10 +353,44 @@ _a_recent_history() {
     printf '%s\n' "$h" | grep -v '^a ' | awk 'NF'
 }
 
-# 当前环境摘要: 工作目录 + git 分支/变更数 + 目录条目（最多 15 项）。
-# 帮助 AI 生成贴合当前路径的命令（如"删掉这个临时文件"不再瞎猜路径）。
+# 从 stdin 读入全部目录条目，选出至多 <limit> 项输出（供 _a_env_context 注入）:
+# 与 <query> 相关的优先——从 query 提取 ASCII 词元，词元完整出现在文件名中得分最高，
+# 词元最长前缀（≥3 字符）命中次之，覆盖"linuxiso"→"linuxmint-….iso"这类口语缩写；
+# 剩余名额按修改时间新→旧补足，近期下载/新建的文件也能进入上下文。
+_a_pick_dir_entries() {
+    local query=$1 limit=$2 matched n
+    matched=$(awk -v q="$(printf '%s' "$query" | tr '[:upper:]' '[:lower:]')" '
+        BEGIN { nt = split(q, T, /[^a-z0-9]+/) }
+        NF {
+            e = tolower($0)
+            score = 0
+            for (i = 1; i <= nt; i++) {
+                t = T[i]
+                if (length(t) < 3) continue
+                if (index(e, t) > 0) { score += length(t) + 2; continue }
+                for (L = length(t) - 1; L >= 3; L--)
+                    if (index(e, substr(t, 1, L)) > 0) { score += L; break }
+            }
+            if (score > 0) print score "\t" $0
+        }' | sort -t "$(printf '\t')" -k1,1rn -k2 | cut -f2- | head -n "$limit")
+    n=$(printf '%s\n' "$matched" | awk 'NF' | wc -l | tr -d ' ')
+    {
+        [[ -n $matched ]] && printf '%s\n' "$matched"
+        if [[ $n -lt $limit ]]; then
+            ls -At 2>/dev/null | awk -v ex="$matched" '
+                BEGIN { split(ex, X, "\n"); for (k in X) skip[X[k]] = 1 }
+                NF && !($0 in skip)' | head -n $((limit - n))
+        fi
+    } | awk 'NF'
+}
+
+# 当前环境摘要: 工作目录 + git 分支/变更数 + 目录条目。
+# 条目数不超过 A_DIR_ENTRIES（默认 15）时全部列出；超过时智能选取（_a_pick_dir_entries）
+# 并在表头注明总条目数——避免大目录里按字母序截断，导致 AI 看不到用户所指的文件而编造名字。
 _a_env_context() {
-    local branch dirty entries n
+    local query=${1:-} branch dirty entries total
+    local limit=${A_DIR_ENTRIES:-15}
+    [[ $limit =~ ^[0-9]+$ ]] || limit=15
     printf '当前目录: %s\n' "$PWD"
     if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         branch=$(git branch --show-current 2>/dev/null)
@@ -361,12 +398,15 @@ _a_env_context() {
         dirty=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
         printf 'git: 分支 %s（未提交变更 %s 项）\n' "${branch:-unknown}" "$dirty"
     fi
-    entries=$(ls -A 2>/dev/null | head -n 16)
-    n=$(printf '%s\n' "$entries" | wc -l | tr -d ' ')
-    if [[ $n -gt 15 ]]; then
-        printf '目录内容（仅列前 15 项）:\n%s\n' "$(printf '%s\n' "$entries" | head -n 15)"
-    elif [[ -n $entries ]]; then
-        printf '目录内容:\n%s\n' "$entries"
+    [[ $limit -eq 0 ]] && return 0
+    entries=$(ls -A 2>/dev/null)
+    total=$(printf '%s\n' "$entries" | awk 'NF' | wc -l | tr -d ' ')
+    [[ ${total:-0} -gt 0 ]] || return 0
+    if [[ $total -le $limit ]]; then
+        printf '目录内容（共 %s 项）:\n%s\n' "$total" "$entries"
+    else
+        printf '目录内容（共 %s 项，仅列 %s 项: 与请求可能相关的优先，其余按修改时间新→旧）:\n%s\n' \
+            "$total" "$limit" "$(printf '%s\n' "$entries" | _a_pick_dir_entries "$query" "$limit")"
     fi
 }
 
@@ -424,6 +464,11 @@ a —— 自然语言转 bash 命令（agent-cli-bash）
       a 刚才那条报错了，帮我修复
   a -c 可随时清空上下文重新开始。
 
+上下文理解:
+  目录条目与请求相关者优先入选（如"算 linuxiso 的 sha256"会优先列出 linuxmint-*.iso），
+  其余按修改时间补足；AI 被要求不得编造文件名，所指文件不明确时会把问题以 ❓ 反问，
+  按提示输入补充信息即可在同轮继续生成命令，直接回车取消。
+
 配置（环境变量或 ~/.config/agent-cli-bash/config）:
   A_PROVIDER         提供商: deepseek(默认) openai kimi qwen zhipu grok ollama openrouter
   A_API_KEY          API 密钥；未设时自动读取提供商对应变量（如 OPENAI_API_KEY）
@@ -433,6 +478,7 @@ a —— 自然语言转 bash 命令（agent-cli-bash）
   A_MAX_RETRIES      网络错误/429/5xx 自动重试次数，默认 3（0=禁用），指数退避
   A_MAX_CONTEXT_CHARS 会话上下文字符预算，默认 24000（约 12K token），超出裁掉最旧的轮次
   A_TIMEOUT          单次 API 请求超时秒数，默认 60
+  A_DIR_ENTRIES      目录条目注入上限，默认 15（0=不注入）；超出时相关的优先、其余按修改时间
 
 示例:
   a 找出当前目录下最大的 5 个文件
@@ -448,145 +494,21 @@ _a_err() {
     printf 'a: %s\n' "$1" >&2
 }
 
-# ---------- 主函数 ----------
-
-a() {
-    local print_only=0 auto_yes=0
-    local OPTIND opt
-    while getopts ":pych-:" opt; do
-        case $opt in
-            p) print_only=1 ;;
-            y) auto_yes=1 ;;
-            c) _A_CONV=''; printf '已清空本会话的对话上下文\n' >&2; return 0 ;;
-            h) _a_help; return 0 ;;
-            -)
-                case $OPTARG in
-                    help)     _a_help; return 0 ;;
-                    version)  printf 'agent-cli-bash %s\n' "$A_VERSION"; return 0 ;;
-                    providers) _a_list_providers; return 0 ;;
-                    setup)    _a_setup; return ;;
-                    show)     _a_show; return 0 ;;
-                    clear)   _A_CONV=''; printf '已清空本会话的对话上下文\n' >&2; return 0 ;;
-                    *) _a_err "未知选项 --$OPTARG（try: a -h）"; return 2 ;;
-                esac
-                ;;
-            *) _a_err "未知选项 -$OPTARG（try: a -h）"; return 2 ;;
-        esac
-    done
-    shift $((OPTIND - 1))
-
-    # 子命令形式: a providers / a setup
-    if [[ ${1:-} == providers ]]; then
-        _a_list_providers
-        return 0
-    fi
-    if [[ ${1:-} == setup ]]; then
-        _a_setup
-        return
-    fi
-
-    # 管道输入: cat error.log | a 解释这个报错
-    # stdin 非终端时读取内容作为上下文（限 8KB）；此后交互确认改从 /dev/tty 读取
-    local stdin_data=
-    if [[ ! -t 0 ]]; then
-        stdin_data=$(head -c 8192 2>/dev/null)
-    fi
-
-    if [[ $# -eq 0 && -z $stdin_data ]]; then
-        _a_help
-        return 2
-    fi
-    local query="$*"
-    [[ -z $query ]] && query="分析以上管道输入，给出下一步需要执行的 bash 命令"
-    _a_load_config
-
-    # 提供商解析: A_* 显式配置 > 提供商默认 > 旧 DEEPSEEK_*（仅 deepseek，向后兼容）
-    local provider=${A_PROVIDER:-deepseek}
-    local base_url model api_key=
-    local pbase pmodel kenv
-    pbase=$(_a_provider_field "$provider" 2)
-    pmodel=$(_a_provider_field "$provider" 3)
-    kenv=$(_a_provider_field "$provider" 4)
-    if [[ $provider == deepseek ]]; then
-        base_url=${A_BASE_URL:-${DEEPSEEK_BASE_URL:-$pbase}}
-        model=${A_MODEL:-${DEEPSEEK_MODEL:-$pmodel}}
+# 组装请求消息数组: system + 会话历史（如有，经裁剪）+ 本轮用户消息
+_a_msgs_json() {
+    local sys_json=$1 user_json=$2
+    if [[ -n ${_A_CONV:-} ]]; then
+        printf '%s,%s,%s' "$sys_json" \
+            "$(printf '%s\n' "$_A_CONV" | _a_conv_trim | cut -f2- | paste -sd ',' -)" "$user_json"
     else
-        base_url=${A_BASE_URL:-$pbase}
-        model=${A_MODEL:-$pmodel}
+        printf '%s,%s' "$sys_json" "$user_json"
     fi
-    api_key=${A_API_KEY:-}
-    if [[ -z $api_key && -n $kenv ]]; then
-        # 读取提供商对应的环境变量（如 OPENAI_API_KEY / MOONSHOT_API_KEY）
-        if [[ -n ${ZSH_VERSION:-} ]]; then
-            api_key=${(P)kenv}
-        else
-            api_key=${!kenv}
-        fi
-    fi
-    [[ -z $api_key ]] && api_key=${DEEPSEEK_API_KEY:-}
-    local timeout=${A_TIMEOUT:-60}
+}
 
-    if [[ -z $base_url ]]; then
-        _a_err "未知提供商 '$provider'"
-        printf '  支持: deepseek openai kimi qwen zhipu grok ollama openrouter（a providers 查看）\n' >&2
-        printf '  其他 OpenAI 兼容网关: 设 A_PROVIDER=custom 并配 A_BASE_URL + A_MODEL\n' >&2
-        return 1
-    fi
-
-    # ollama 本地服务无需密钥，其余提供商必须配置
-    if [[ -z $api_key && $provider != ollama ]]; then
-        _a_err "未配置 API 密钥"
-        printf '  1) 运行 a setup 交互式配置\n' >&2
-        printf '  2) export A_API_KEY=sk-xxx 或 %s\n' "${kenv:-DEEPSEEK_API_KEY}" >&2
-        printf '  3) 或写入 ~/.config/agent-cli-bash/config（A_API_KEY=sk-xxx）\n' >&2
-        return 1
-    fi
-    command -v curl >/dev/null 2>&1 || { _a_err "需要 curl"; return 1; }
-    if ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
-        _a_err "需要 jq 或 python3 之一来解析响应"
-        return 1
-    fi
-
-    if [[ -n ${_A_CONV:-} ]]; then
-        printf '💬 接续本会话对话（a -c 可清空）\n' >&2
-    fi
-
-    local sys_prompt sys_json user_json msgs_json
-    sys_prompt="You convert natural language into bash/zsh command(s). Rules: reply with the command(s) ONLY - no explanation, no markdown fences, no leading \$. If the task needs multiple sequential steps, output multiple lines (one command per line) or chain with && / ;. You may receive prior conversation: earlier requests, the commands you proposed, and their execution results (exit code and output). Use them to interpret follow-up requests like 'only the first 10' or 'fix that error'. The current working directory (with a git state summary and a directory listing) and a snippet of recent shell history may also be provided as context. Target OS: $(uname -s) ($(uname -m))."
-    sys_json=$(printf '{"role":"system","content":"%s"}' "$(_a_json_escape "$sys_prompt")")
-
-    # 用户消息 = 管道输入(如有) + 最近终端历史(参考) + 本次请求
-    local hist user_content=""
-    hist=$(_a_recent_history)
-    if [[ -n $stdin_data ]]; then
-        printf '📎 已读取管道输入 %d 字节（超过 8KB 截断）\n' "${#stdin_data}" >&2
-        user_content="管道输入(可能截断):
-$stdin_data
-
-"
-    fi
-    local env_ctx
-    env_ctx=$(_a_env_context 2>/dev/null)
-    if [[ -n $env_ctx ]]; then
-        user_content="${user_content}当前环境:
-$env_ctx
-
-"
-    fi
-    if [[ -n $hist ]]; then
-        user_content="${user_content}最近终端历史命令(仅作参考):
-$hist
-
-"
-    fi
-    user_content="${user_content}请求: $query"
-    user_json=$(printf '{"role":"user","content":"%s"}' "$(_a_json_escape "$user_content")")
-
-    msgs_json="$sys_json,$user_json"
-    if [[ -n ${_A_CONV:-} ]]; then
-        msgs_json="$sys_json,$(printf '%s\n' "$_A_CONV" | _a_conv_trim | cut -f2- | paste -sd ',' -),$user_json"
-    fi
-
+# 发送一轮对话请求，stdout 输出清理后的回复（左端去空白）；失败时 stderr 报错并返回非 0。
+# 供 a() 在 ASK 追问循环中反复调用。
+_a_generate() {
+    local msgs_json=$1 base_url=$2 api_key=$3 timeout=$4 model=$5
     local payload
     payload=$(printf '{"model":"%s","messages":[%s],"temperature":0,"max_tokens":512,"stream":true}' \
         "$(_a_json_escape "$model")" "$msgs_json")
@@ -697,12 +619,178 @@ $hist
 
     local cmd
     cmd=$(_a_clean "$content")
+    cmd=${cmd#"${cmd%%[![:space:]]*}"}   # 左端去空白，保证 ASK: 前缀检测稳定
     if [[ -z $cmd ]]; then
         _a_err "AI 返回内容为空"
         return 1
     fi
+    printf '%s\n' "$cmd"
+}
 
-    # 记入本会话对话：本次请求 + AI 给出的命令（未执行也记录，便于下一轮追问）
+# ---------- 主函数 ----------
+
+a() {
+    local print_only=0 auto_yes=0
+    local OPTIND opt
+    while getopts ":pych-:" opt; do
+        case $opt in
+            p) print_only=1 ;;
+            y) auto_yes=1 ;;
+            c) _A_CONV=''; printf '已清空本会话的对话上下文\n' >&2; return 0 ;;
+            h) _a_help; return 0 ;;
+            -)
+                case $OPTARG in
+                    help)     _a_help; return 0 ;;
+                    version)  printf 'agent-cli-bash %s\n' "$A_VERSION"; return 0 ;;
+                    providers) _a_list_providers; return 0 ;;
+                    setup)    _a_setup; return ;;
+                    show)     _a_show; return 0 ;;
+                    clear)   _A_CONV=''; printf '已清空本会话的对话上下文\n' >&2; return 0 ;;
+                    *) _a_err "未知选项 --$OPTARG（try: a -h）"; return 2 ;;
+                esac
+                ;;
+            *) _a_err "未知选项 -$OPTARG（try: a -h）"; return 2 ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    # 子命令形式: a providers / a setup
+    if [[ ${1:-} == providers ]]; then
+        _a_list_providers
+        return 0
+    fi
+    if [[ ${1:-} == setup ]]; then
+        _a_setup
+        return
+    fi
+
+    # 管道输入: cat error.log | a 解释这个报错
+    # stdin 非终端时读取内容作为上下文（限 8KB）；此后交互确认改从 /dev/tty 读取
+    local stdin_data=
+    if [[ ! -t 0 ]]; then
+        stdin_data=$(head -c 8192 2>/dev/null)
+    fi
+
+    if [[ $# -eq 0 && -z $stdin_data ]]; then
+        _a_help
+        return 2
+    fi
+    local query="$*"
+    [[ -z $query ]] && query="分析以上管道输入，给出下一步需要执行的 bash 命令"
+    _a_load_config
+
+    # 提供商解析: A_* 显式配置 > 提供商默认 > 旧 DEEPSEEK_*（仅 deepseek，向后兼容）
+    local provider=${A_PROVIDER:-deepseek}
+    local base_url model api_key=
+    local pbase pmodel kenv
+    pbase=$(_a_provider_field "$provider" 2)
+    pmodel=$(_a_provider_field "$provider" 3)
+    kenv=$(_a_provider_field "$provider" 4)
+    if [[ $provider == deepseek ]]; then
+        base_url=${A_BASE_URL:-${DEEPSEEK_BASE_URL:-$pbase}}
+        model=${A_MODEL:-${DEEPSEEK_MODEL:-$pmodel}}
+    else
+        base_url=${A_BASE_URL:-$pbase}
+        model=${A_MODEL:-$pmodel}
+    fi
+    api_key=${A_API_KEY:-}
+    if [[ -z $api_key && -n $kenv ]]; then
+        # 读取提供商对应的环境变量（如 OPENAI_API_KEY / MOONSHOT_API_KEY）
+        if [[ -n ${ZSH_VERSION:-} ]]; then
+            api_key=${(P)kenv}
+        else
+            api_key=${!kenv}
+        fi
+    fi
+    [[ -z $api_key ]] && api_key=${DEEPSEEK_API_KEY:-}
+    local timeout=${A_TIMEOUT:-60}
+
+    if [[ -z $base_url ]]; then
+        _a_err "未知提供商 '$provider'"
+        printf '  支持: deepseek openai kimi qwen zhipu grok ollama openrouter（a providers 查看）\n' >&2
+        printf '  其他 OpenAI 兼容网关: 设 A_PROVIDER=custom 并配 A_BASE_URL + A_MODEL\n' >&2
+        return 1
+    fi
+
+    # ollama 本地服务无需密钥，其余提供商必须配置
+    if [[ -z $api_key && $provider != ollama ]]; then
+        _a_err "未配置 API 密钥"
+        printf '  1) 运行 a setup 交互式配置\n' >&2
+        printf '  2) export A_API_KEY=sk-xxx 或 %s\n' "${kenv:-DEEPSEEK_API_KEY}" >&2
+        printf '  3) 或写入 ~/.config/agent-cli-bash/config（A_API_KEY=sk-xxx）\n' >&2
+        return 1
+    fi
+    command -v curl >/dev/null 2>&1 || { _a_err "需要 curl"; return 1; }
+    if ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+        _a_err "需要 jq 或 python3 之一来解析响应"
+        return 1
+    fi
+
+    if [[ -n ${_A_CONV:-} ]]; then
+        printf '💬 接续本会话对话（a -c 可清空）\n' >&2
+    fi
+
+    local sys_prompt sys_json user_json msgs_json
+    sys_prompt="You convert natural language into bash/zsh command(s). Rules: reply with the command(s) ONLY - no explanation, no markdown fences, no leading \$. If the task needs multiple sequential steps, output multiple lines (one command per line) or chain with && / ;. You may receive prior conversation: earlier requests, the commands you proposed, and their execution results (exit code and output). Use them to interpret follow-up requests like 'only the first 10' or 'fix that error'. The current working directory (with a git state summary and a directory listing) and a snippet of recent shell history may also be provided as context. The directory listing may be partial (its header shows the total entry count): NEVER invent file or directory names - use only exact names that appear in the context, and interpret loose user wording against the listed names (e.g. 'linuxiso' matches a listed linuxmint-*.iso). If the file/directory the user refers to is still ambiguous or absent from the context, do NOT guess: reply with one short clarifying question, alone on a single line prefixed exactly with 'ASK: ' (example: ASK: 目录里有多个 iso 文件，要计算哪一个的 sha256？); after the user's supplementary answer, generate the command. Target OS: $(uname -s) ($(uname -m))."
+    sys_json=$(printf '{"role":"system","content":"%s"}' "$(_a_json_escape "$sys_prompt")")
+
+    # 用户消息 = 管道输入(如有) + 最近终端历史(参考) + 本次请求
+    local hist user_content=""
+    hist=$(_a_recent_history)
+    if [[ -n $stdin_data ]]; then
+        printf '📎 已读取管道输入 %d 字节（超过 8KB 截断）\n' "${#stdin_data}" >&2
+        user_content="管道输入(可能截断):
+$stdin_data
+
+"
+    fi
+    local env_ctx
+    env_ctx=$(_a_env_context "$query" 2>/dev/null)
+    if [[ -n $env_ctx ]]; then
+        user_content="${user_content}当前环境:
+$env_ctx
+
+"
+    fi
+    if [[ -n $hist ]]; then
+        user_content="${user_content}最近终端历史命令(仅作参考):
+$hist
+
+"
+    fi
+    user_content="${user_content}请求: $query"
+    user_json=$(printf '{"role":"user","content":"%s"}' "$(_a_json_escape "$user_content")")
+
+    local cmd ask_rounds=0 ask_content answer
+    cmd=$(_a_generate "$(_a_msgs_json "$sys_json" "$user_json")" "$base_url" "$api_key" "$timeout" "$model") || return 1
+
+    # AI 拿不准时反问（回复以 ASK: 开头）: 展示问题并等用户补充，把「问题+补充」
+    # 并入会话上下文后重新生成，最多 3 轮；空回答或无终端则取消，不执行任何东西。
+    while [[ $cmd == ASK:* ]]; do
+        if [[ $ask_rounds -ge 3 ]]; then
+            _a_err "AI 连续追问已达 3 轮上限，请补充更明确的信息后重试"
+            return 1
+        fi
+        ask_content=${cmd#ASK:}
+        ask_content=${ask_content#"${ask_content%%[![:space:]]*}"}
+        printf '❓ %s\n' "$ask_content" >&2
+        printf '补充信息(直接回车取消): ' >&2
+        if ! IFS= read -r answer < /dev/tty 2>/dev/null; then
+            answer=
+            printf '\n(无终端可交互；请在描述中补充信息后重试)\n' >&2
+        fi
+        if [[ -z $answer ]]; then
+            _a_err "已取消（未补充信息）"
+            return 1
+        fi
+        _a_conv_append Q "$user_json"
+        _a_conv_append A "$(printf '{"role":"assistant","content":"%s"}' "$(_a_json_escape "$cmd")")"
+        user_json=$(printf '{"role":"user","content":"%s"}' "$(_a_json_escape "补充: $answer")")
+        ask_rounds=$((ask_rounds + 1))
+        cmd=$(_a_generate "$(_a_msgs_json "$sys_json" "$user_json")" "$base_url" "$api_key" "$timeout" "$model") || return 1
+    done
+
+    # 记入本会话对话：本次请求（或 ASK 补充后的最终请求）+ AI 给出的命令（未执行也记录，便于下一轮追问）
     _a_conv_append Q "$user_json"
     _a_conv_append A "$(printf '{"role":"assistant","content":"%s"}' "$(_a_json_escape "$cmd")")"
 
