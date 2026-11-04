@@ -48,6 +48,8 @@ _a_load_config() {
             A_TIMEOUT)           [[ -n ${A_TIMEOUT:-}           ]] || A_TIMEOUT=$val ;;
             A_STEP_TIMEOUT)      [[ -n ${A_STEP_TIMEOUT:-}      ]] || A_STEP_TIMEOUT=$val ;;
             A_DIR_ENTRIES)       [[ -n ${A_DIR_ENTRIES:-}       ]] || A_DIR_ENTRIES=$val ;;
+            A_AGENT_MAX_STEPS)   [[ -n ${A_AGENT_MAX_STEPS:-}   ]] || A_AGENT_MAX_STEPS=$val ;;
+            A_AGENT_MAX_TOKENS)  [[ -n ${A_AGENT_MAX_TOKENS:-}  ]] || A_AGENT_MAX_TOKENS=$val ;;
             DEEPSEEK_API_KEY)  [[ -n ${DEEPSEEK_API_KEY:-}  ]] || DEEPSEEK_API_KEY=$val ;;
             DEEPSEEK_BASE_URL) [[ -n ${DEEPSEEK_BASE_URL:-} ]] || DEEPSEEK_BASE_URL=$val ;;
             DEEPSEEK_MODEL)    [[ -n ${DEEPSEEK_MODEL:-}    ]] || DEEPSEEK_MODEL=$val ;;
@@ -243,6 +245,57 @@ except Exception:
     fi
 }
 
+# 从 stdin 的 JSON 中按点路径取值（如 '.file_path'、'.questions[0].question'）。
+# 输出原始值（字符串原样含换行、数字/布尔转文本），缺失/null 输出空。
+# 支持逐级字段名与 [N] 数组下标。jq 用 -j: 不补尾换行，保证多行字符串精确。
+_a_json_path() { # _a_json_path <点路径>
+    # 变量名避开 path——zsh 中 path 与 PATH 绑定，local 赋值会破坏命令查找
+    local pth=$1
+    if command -v jq >/dev/null 2>&1; then
+        jq -j "$pth // empty" 2>/dev/null
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json, re, sys
+try:
+    v = json.load(sys.stdin)
+    for part in sys.argv[1].lstrip(".").split("."):
+        m = re.match(r"^([^\[\]]+)\[(\d+)\]$", part)
+        if m:
+            v = v[m.group(1)][int(m.group(2))]
+        else:
+            v = v[part]
+    if v is None:
+        v = ""
+    elif v is True:
+        v = "true"
+    elif v is False:
+        v = "false"
+    sys.stdout.write(str(v))
+except Exception:
+    sys.exit(1)' "$pth" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+# 从 stdin 的完整响应 JSON 中取 tool_calls，每行输出一条 compact JSON；无 tool_calls 时无输出
+_a_json_tool_calls() {
+    if command -v jq >/dev/null 2>&1; then
+        jq -c '.choices[0].message.tool_calls[]? // empty' 2>/dev/null
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    for c in d["choices"][0]["message"].get("tool_calls") or []:
+        sys.stdout.write(json.dumps(c, ensure_ascii=False, separators=(",", ":")) + "\n")
+except Exception:
+    pass' 2>/dev/null
+    else
+        return 1
+    fi
+}
+
 _a_err() {
     printf 'a: %s\n' "$1" >&2
 }
@@ -297,18 +350,12 @@ _a_resolve_provider() {
     fi
 }
 
-# 发送一轮对话请求，stdout 输出模型的原始回复；失败时 stderr 报错并返回非 0。
-# 输出解析（围栏清洗等）是产品层的职责，本函数不改动内容。
-_a_generate() { # _a_generate <msgs_json> <base_url> <api_key> <timeout> <model> [max_tokens=512] [temperature=0]
-    local msgs_json=$1 base_url=$2 api_key=$3 timeout=$4 model=$5
-    local max_tokens=${6:-512} temperature=${7:-0}
-    local payload
-    payload=$(printf '{"model":"%s","messages":[%s],"temperature":%s,"max_tokens":%s,"stream":true}' \
-        "$(_a_json_escape "$model")" "$msgs_json" "$temperature" "$max_tokens")
-
-    # 流式请求（SSE）：AI 生成的内容实时显示；增量与异常分别落盘，循环外汇总。
-    # 网络错误与 HTTP 429/5xx 自动重试（指数退避，优先遵循 Retry-After），
-    # 重试次数由 A_MAX_RETRIES 控制（默认 3，0 = 禁用）。
+# 统一 POST: curl + 密钥文件 + 429/5xx/网络错误指数退避重试 + 失败报错，流式/整包两态。
+#   stream 模式: SSE 增量实时灰显并累积，成功设全局 _A_POST_CONTENT，重试判据为「无增量」
+#   body   模式: 整包落盘不展示，成功设全局 _A_POST_BODY，重试判据为网络错误/429/5xx
+# 成功返回 0 并清理临时文件；失败向 stderr 报错并返回 1（原始错误详情尽量透出）。
+_a_api_post() { # _a_api_post <payload> <stream|body> <base_url> <api_key> <timeout>
+    local payload=$1 mode=$2 base_url=$3 api_key=$4 timeout=$5
     printf '🤖 思考中...\r' >&2
     local raw_file content_file err_file hdr_file hdr_conf_file curl_rc=0 content http_code=
     raw_file=$(mktemp "${TMPDIR:-/tmp}/a-raw.XXXXXX")
@@ -326,41 +373,66 @@ _a_generate() { # _a_generate <msgs_json> <base_url> <api_key> <timeout> <model>
     local sse_line='' sse_data='' sse_delta='' sse_shown=0
     while :; do
         : > "$raw_file"; : > "$content_file"; : > "$err_file"; : > "$hdr_file"
-        curl -sS -N --max-time "$timeout" -D "$hdr_file" \
-            -K "$hdr_conf_file" \
-            -d "$payload" \
-            "$base_url/chat/completions" 2>"$err_file" | tee "$raw_file" | {
-            sse_line=''; sse_data=''; sse_delta=''; sse_shown=0
-            while IFS= read -r sse_line; do
-                if [[ $sse_line == data:* ]]; then
-                    sse_data=${sse_line#data: }
-                    [[ $sse_data == '[DONE]' ]] && break
-                    # x 占位保留输出，再剥掉哨兵换行：内容内部的换行不丢、也不多出换行
-                    sse_delta=$(printf '%s' "$sse_data" | _a_json_delta; printf x)
-                    sse_delta=${sse_delta%x}
-                    sse_delta=${sse_delta%$'\n'}
-                    if [[ -n $sse_delta ]]; then
-                        if [[ $sse_shown == 0 ]]; then
-                            printf '\r\033[K\033[2m' >&2
-                            sse_shown=1
+        if [[ $mode == stream ]]; then
+            curl -sS -N --max-time "$timeout" -D "$hdr_file" \
+                -K "$hdr_conf_file" \
+                -d "$payload" \
+                "$base_url/chat/completions" 2>"$err_file" | tee "$raw_file" | {
+                sse_line=''; sse_data=''; sse_delta=''; sse_shown=0
+                while IFS= read -r sse_line; do
+                    if [[ $sse_line == data:* ]]; then
+                        sse_data=${sse_line#data: }
+                        [[ $sse_data == '[DONE]' ]] && break
+                        # x 占位保留输出，再剥掉哨兵换行：内容内部的换行不丢、也不多出换行
+                        sse_delta=$(printf '%s' "$sse_data" | _a_json_delta; printf x)
+                        sse_delta=${sse_delta%x}
+                        sse_delta=${sse_delta%$'\n'}
+                        if [[ -n $sse_delta ]]; then
+                            if [[ $sse_shown == 0 ]]; then
+                                printf '\r\033[K\033[2m' >&2
+                                sse_shown=1
+                            fi
+                            printf '%s' "$sse_delta" >&2
+                            printf '%s' "$sse_delta" >> "$content_file"
                         fi
-                        printf '%s' "$sse_delta" >&2
-                        printf '%s' "$sse_delta" >> "$content_file"
+                    else
+                        [[ -n $sse_line ]] && printf '%s\n' "$sse_line" >> "$err_file"
                     fi
-                else
-                    [[ -n $sse_line ]] && printf '%s\n' "$sse_line" >> "$err_file"
-                fi
-            done
-        }
-        curl_rc=${PIPESTATUS[0]:-${pipestatus[1]:-0}}
-        printf '\033[0m\n' >&2
-        content=$(cat "$content_file" 2>/dev/null)
+                done
+            }
+            curl_rc=${PIPESTATUS[0]:-${pipestatus[1]:-0}}
+            printf '\033[0m\n' >&2
+            content=$(cat "$content_file" 2>/dev/null)
+        else
+            curl -sS --max-time "$timeout" -D "$hdr_file" \
+                -K "$hdr_conf_file" \
+                -d "$payload" \
+                "$base_url/chat/completions" > "$raw_file" 2>"$err_file"
+            curl_rc=$?
+            printf '\r\033[K' >&2
+            content=$(cat "$raw_file" 2>/dev/null)
+        fi
         http_code=$(awk 'NR==1{print $2; exit}' "$hdr_file" 2>/dev/null)
 
         retry=; reason=
-        if [[ -z $content ]]; then
+        if [[ $mode == stream ]]; then
+            # 流式以「是否有增量」为成功判据：无增量时才看网络/HTTP 错误
+            if [[ -z $content ]]; then
+                if [[ $curl_rc -ne 0 ]]; then
+                    # 可重试的网络类退出码（DNS/连接/超时/SSL/重置等）；中断类不重试
+                    case $curl_rc in
+                        6|7|16|18|23|26|28|35|52|55|56) retry=1; reason="网络错误 (curl $curl_rc)" ;;
+                    esac
+                else
+                    case $http_code in
+                        429) retry=1; reason="HTTP 429 限流" ;;
+                        5??) retry=1; reason="HTTP $http_code 服务端错误" ;;
+                    esac
+                fi
+            fi
+        else
+            # 整包模式: 网络错误与 429/5xx 直接重试（错误响应体不是有效内容）
             if [[ $curl_rc -ne 0 ]]; then
-                # 可重试的网络类退出码（DNS/连接/超时/SSL/重置等）；中断类不重试
                 case $curl_rc in
                     6|7|16|18|23|26|28|35|52|55|56) retry=1; reason="网络错误 (curl $curl_rc)" ;;
                 esac
@@ -386,8 +458,17 @@ _a_generate() { # _a_generate <msgs_json> <base_url> <api_key> <timeout> <model>
         printf '🤖 重试中...\r' >&2
     done
 
-    if [[ -z $content ]]; then
-        # 流式失败：优先按错误 JSON 解析（如 401），其次尝试整包解析（网关忽略 stream 参数时）
+    # 成功判据: 流式=有增量; 整包=有响应体且非 429/5xx 且 curl 正常
+    local ok_rc=0
+    if [[ $mode == stream ]]; then
+        [[ -z $content ]] && ok_rc=1
+    else
+        if [[ -z $content || $curl_rc -ne 0 || $http_code == 429 || $http_code == 5* ]]; then
+            ok_rc=1
+        fi
+    fi
+    if [[ $ok_rc -ne 0 ]]; then
+        # 失败: 优先按错误 JSON 解析（如 401），其次尝试整包解析（网关忽略 stream 参数时）
         printf '\r\033[K' >&2
         [[ $attempt -gt 0 ]] && printf '⏳ 已自动重试 %d 次仍失败\n' "$attempt" >&2
         local errout emsg
@@ -408,6 +489,40 @@ _a_generate() { # _a_generate <msgs_json> <base_url> <api_key> <timeout> <model>
             return 1
         fi
     fi
+    if [[ $mode == stream ]]; then
+        _A_POST_CONTENT=$content
+    else
+        _A_POST_BODY=$content
+    fi
     rm -f "$raw_file" "$content_file" "$err_file" "$hdr_file" "$hdr_conf_file"
-    printf '%s\n' "$content"
+}
+
+# 发送一轮对话请求（SSE 流式，AI 生成内容实时显示），stdout 输出模型的原始回复；
+# 失败时 stderr 报错并返回非 0。输出解析（围栏清洗等）是产品层的职责，本函数不改动内容。
+_a_generate() { # _a_generate <msgs_json> <base_url> <api_key> <timeout> <model> [max_tokens=512] [temperature=0]
+    local msgs_json=$1 base_url=$2 api_key=$3 timeout=$4 model=$5
+    local max_tokens=${6:-512} temperature=${7:-0}
+    local payload
+    payload=$(printf '{"model":"%s","messages":[%s],"temperature":%s,"max_tokens":%s,"stream":true}' \
+        "$(_a_json_escape "$model")" "$msgs_json" "$temperature" "$max_tokens")
+    _a_api_post "$payload" stream "$base_url" "$api_key" "$timeout" || return 1
+    printf '%s\n' "$_A_POST_CONTENT"
+}
+
+# agent 单步请求: 非流式（tool_calls 的流式增量聚合复杂且收益低，取舍见 README），
+# 携带工具表。成功设 _A_AGENT_CONTENT（文本回复，可为空）与 _A_AGENT_TOOL_CALLS
+# （每行一条 compact JSON 的调用列表，可为空）并返回 0；失败 stderr 报错返回 1。
+_a_agent_request() { # _a_agent_request <msgs_json> <tools_json>
+    local msgs_json=$1 tools_json=$2
+    local payload
+    payload=$(printf '{"model":"%s","messages":[%s],"temperature":0,"max_tokens":%s,"stream":false,"tools":[%s],"tool_choice":"auto"}' \
+        "$(_a_json_escape "$_A_R_MODEL")" "$msgs_json" "${A_AGENT_MAX_TOKENS:-4096}" "$tools_json")
+    _a_api_post "$payload" body "$_A_R_URL" "$_A_R_KEY" "$_A_R_TIMEOUT" || return 1
+    _A_AGENT_CONTENT=$(printf '%s' "$_A_POST_BODY" | _a_json_content)
+    _A_AGENT_TOOL_CALLS=$(printf '%s' "$_A_POST_BODY" | _a_json_tool_calls)
+    if [[ -z $_A_AGENT_CONTENT && -z $_A_AGENT_TOOL_CALLS ]]; then
+        _a_err "API 返回内容为空"
+        return 1
+    fi
+    return 0
 }

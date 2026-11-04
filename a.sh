@@ -5,6 +5,7 @@
 #   a -p <自然语言>     只生成并打印命令，不执行
 #   a -y <自然语言>     生成后直接执行，不询问（谨慎）
 #   a ask <问题>        自由问答：直接给答案，不生成/执行命令
+#   a agent <任务>      工具调用循环：AI 自主多步执行直到完成任务
 #   a -c                清空本会话的多轮对话上下文
 #
 # 多轮: 同一 shell 会话内，之前的问答、生成的命令、执行结果（退出码+输出尾部）、
@@ -17,8 +18,11 @@
 # 旧版 DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL 仍然兼容
 #
 # 结构: 本文件是入口与产品层（prompt/输出解析/UX）；通用 harness 在 lib/ 下——
-#   lib/a-api.sh  传输域（提供商/配置/SSE 客户端）  lib/a-ctx.sh  上下文域（会话/环境采集）
-#   lib/a-exec.sh 执行域（风险/确认执行）
+#   lib/a-api.sh   传输域（提供商/配置/SSE 客户端）
+#   lib/a-ctx.sh   上下文域（会话/环境采集/agent 事件日志）
+#   lib/a-exec.sh  执行域（风险/确认执行）
+#   lib/a-tools.sh 工具域（工具注册表/执行管线）
+#   lib/a-agent.sh agent 循环域（turn/step 工具调用循环）
 # 仓库需整体携带（a.sh 与 lib/ 同级），rc 只需 source 本文件。
 
 A_VERSION="0.5.0"
@@ -35,11 +39,13 @@ _A_HOME=$(cd -- "$(dirname -- "$_A_SELF")" && pwd)
 source "$_A_HOME/lib/a-api.sh"
 source "$_A_HOME/lib/a-ctx.sh"
 source "$_A_HOME/lib/a-exec.sh"
+source "$_A_HOME/lib/a-tools.sh"
+source "$_A_HOME/lib/a-agent.sh"
 
 # ---------- 产品层 ----------
 
-# 能力模式表: 每个模式一条独立会话（_A_CONV_<mode>），a -c 全部清空
-_A_MODES=(run ask)
+# 能力模式表: 每个模式一条独立会话（run/ask 用 _A_CONV_<mode>，agent 用 _A_EV_<mode>），a -c 全部清空
+_A_MODES=(run ask agent)
 
 # 清理 AI 返回内容：去掉 markdown 代码围栏与空行
 _a_clean() {
@@ -69,6 +75,7 @@ a —— 自然语言转 bash 命令（agent-cli-bash）
   a -p <自然语言>    只打印命令，不执行
   a -y <自然语言>    生成后直接执行，不询问（谨慎使用）
   a ask <问题>       自由问答：直接回答，不生成/执行命令（支持管道输入）
+  a agent <任务>     工具调用循环：AI 自主多步执行直到完成任务（支持管道输入）
   a -c               清空本会话的多轮对话上下文
   a --show           查看当前会话的上下文构成（轮次/体积/裁剪情况）
   a -h | --help      显示帮助
@@ -77,6 +84,16 @@ a —— 自然语言转 bash 命令（agent-cli-bash）
   a setup            交互式配置提供商与密钥（写入 config，600 权限，立即生效）
 
 确认时: y=执行  n=不执行(退出码130)  i=忽略(退出码0)  直接回车等同 n
+
+agent 模式（工具调用循环）:
+  AI 通过调用工具自主完成任务: bash(执行命令)、read/write/edit(文件)、grep/glob(搜索)、
+  working_directory(切换会话目录)、todo_write(任务清单)、ask_user_question(向你提问)、
+  web_fetch(抓取网页)，循环"调用工具→看结果→继续"直到给出最终回答。
+  每次 bash/写文件调用仍走风险分级确认: 高危恒确认（即使 -y）、写操作无 -y 时确认、
+  只读工具自动放行；无终端时需确认的调用一律拒绝并把原因回传给 AI。
+  单次任务最多 A_AGENT_MAX_STEPS 步(默认 16)；上下文按轮次裁剪(a -c 清空)。
+  注意: agent 的 bash 每次调用独立，cd/变量不进入你的 shell；需要改动当前 shell
+  请用普通 run 模式。agent 步骤为非流式请求（工具调用的流式聚合代价高，见 README）。
 
 多步执行:
   AI 返回多行命令时按完整 shell 结构切成步骤(跨行的 for/while/if/case、heredoc、
@@ -117,6 +134,8 @@ a —— 自然语言转 bash 命令（agent-cli-bash）
   A_TIMEOUT          单次 API 请求超时秒数，默认 60
   A_STEP_TIMEOUT     单步命令执行超时秒数，默认 600（0=禁用）；超时终止该步，退出码 124
   A_DIR_ENTRIES      目录条目注入上限，默认 15（0=不注入）；超出时相关的优先、其余按修改时间
+  A_AGENT_MAX_STEPS  agent 模式单次任务步数上限，默认 16
+  A_AGENT_MAX_TOKENS agent 模式单步请求 max_tokens，默认 4096
 
 示例:
   a 找出当前目录下最大的 5 个文件
@@ -137,7 +156,7 @@ a() {
         case $opt in
             p) print_only=1 ;;
             y) auto_yes=1 ;;
-            c) local m; for m in "${_A_MODES[@]}"; do _a_conv_clear "$m"; done
+            c) local m; for m in "${_A_MODES[@]}"; do _a_conv_clear "$m"; _a_ev_clear "$m"; done
                printf '已清空本会话的对话上下文\n' >&2; return 0 ;;
             h) _a_help; return 0 ;;
             -)
@@ -147,7 +166,7 @@ a() {
                     providers) _a_list_providers; return 0 ;;
                     setup)    _a_setup; return ;;
                     show)     _a_show "${_A_MODES[@]}"; return 0 ;;
-                    clear)   local m; for m in "${_A_MODES[@]}"; do _a_conv_clear "$m"; done
+                    clear)   local m; for m in "${_A_MODES[@]}"; do _a_conv_clear "$m"; _a_ev_clear "$m"; done
                              printf '已清空本会话的对话上下文\n' >&2; return 0 ;;
                     *) _a_err "未知选项 --$OPTARG（try: a -h）"; return 2 ;;
                 esac
@@ -186,6 +205,19 @@ a() {
         query="$*"
         [[ -z $query ]] && query="分析以上管道输入，回答其中的问题"
         _a_mode_ask "$query" "$stdin_data"
+        return $?
+    fi
+
+    # 子命令: a agent <任务> —— 工具调用循环（多步自主完成任务，详见 _a_help）
+    if [[ ${1:-} == agent ]]; then
+        shift
+        query="$*"
+        [[ -z $query ]] && query="分析以上管道输入并完成任务"
+        if [[ $print_only == 1 ]]; then
+            _a_err "agent 模式不支持 -p（它需要实际执行工具）"
+            return 2
+        fi
+        _a_agent "$query" "$stdin_data" "$auto_yes"
         return $?
     fi
 

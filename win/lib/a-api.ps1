@@ -62,7 +62,8 @@ function _a_load_config {
     $f = if ($env:A_CONFIG_FILE) { $env:A_CONFIG_FILE } else { Join-Path $HOME '.config/agent-cli-bash/config' }
     if (-not (Test-Path -LiteralPath $f)) { return }
     $known = 'A_PROVIDER', 'A_API_KEY', 'A_BASE_URL', 'A_MODEL', 'A_MAX_RETRIES', 'A_MAX_CONTEXT_CHARS',
-             'A_TIMEOUT', 'A_STEP_TIMEOUT', 'A_DIR_ENTRIES', 'DEEPSEEK_API_KEY', 'DEEPSEEK_BASE_URL', 'DEEPSEEK_MODEL'
+             'A_TIMEOUT', 'A_STEP_TIMEOUT', 'A_DIR_ENTRIES', 'A_AGENT_MAX_STEPS', 'A_AGENT_MAX_TOKENS',
+             'DEEPSEEK_API_KEY', 'DEEPSEEK_BASE_URL', 'DEEPSEEK_MODEL'
     foreach ($line in [System.IO.File]::ReadAllLines($f)) {
         if ($line -notmatch '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { continue }
         $key = $Matches[1]; $val = $Matches[2]
@@ -232,6 +233,25 @@ function _a_msg_content([string]$Json) {
         if ($null -ne $d.content) { return "$($d.content)" }
     } catch { }
     return ''
+}
+
+# 从 JSON 文本中按点路径取值（如 '.file_path'、'.questions[0].question'）。
+# 输出原始文本（字符串原样含换行、数字/布尔转小写文本），缺失/null 返回 ''。
+# 支持逐级字段名与 [N] 数组下标。
+function _a_json_path([string]$Json, [string]$Path) {
+    try {
+        $v = ConvertFrom-Json -InputObject $Json
+        foreach ($part in $Path.TrimStart('.').Split('.')) {
+            if ($part -match '^([^\[\]]+)\[(\d+)\]$') {
+                $v = @($v.($Matches[1]))[[int]$Matches[2]]
+            } else {
+                $v = $v.$part
+            }
+        }
+        if ($null -eq $v) { return '' }
+        if ($v -is [bool]) { if ($v) { return 'true' } else { return 'false' } }
+        return "$v"
+    } catch { return '' }
 }
 
 function _a_err([string]$msg) {
@@ -412,4 +432,107 @@ function _a_generate {
     }
     foreach ($f in $files) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
     return $content
+}
+
+# agent 单步请求: 非流式（tool_calls 的流式增量聚合复杂且收益低，取舍见 README），
+# 携带工具表。成功设 $global:_A_AGENT_CONTENT（文本回复，可为 ''）与
+# $global:_A_AGENT_TOOL_CALLS（tool_call 对象数组，可为空数组）并返回 $true；
+# 失败报错并返回 $false。重试判据（网络错误/429/5xx）与 _a_generate 一致。
+function _a_agent_request($Messages, $Tools) {
+    $maxTokens = 4096
+    if ($env:A_AGENT_MAX_TOKENS -match '^\d+$') { $maxTokens = [int]$env:A_AGENT_MAX_TOKENS }
+    $payloadObj = [ordered]@{
+        model = $global:_A_R_MODEL; messages = @($Messages)
+        temperature = 0; max_tokens = $maxTokens; stream = $false
+        tools = @($Tools); tool_choice = 'auto'
+    }
+    # -Depth 32: 工具 schema 的嵌套(ask_user_question 的 options 数组)远超 8 层，
+    # 深度不足会被 ConvertTo-Json 截断成非法 JSON（bash 版为字符串拼接无此问题）
+    $payload = ConvertTo-Json -InputObject $payloadObj -Compress -Depth 32
+
+    Write-Host "`r🤖 思考中...  " -NoNewline
+    $payloadFile = _a_mktemp
+    $bodyFile = _a_mktemp
+    $errFile = _a_mktemp
+    $hdrFile = _a_mktemp
+    $hdrConfFile = _a_mktemp
+    $files = @($payloadFile, $bodyFile, $errFile, $hdrFile, $hdrConfFile)
+    [System.IO.File]::WriteAllText($payloadFile, $payload, $global:_A_UTF8)
+    $hdrLines = New-Object System.Collections.Generic.List[string]
+    $hdrLines.Add('header = "Content-Type: application/json"')
+    if ($global:_A_R_KEY) { $hdrLines.Add('header = "Authorization: Bearer ' + $global:_A_R_KEY + '"') }
+    [System.IO.File]::WriteAllLines($hdrConfFile, $hdrLines, $global:_A_UTF8)
+
+    $curl = _a_curl_cmd
+    $attempt = 0
+    $max_retries = if ($env:A_MAX_RETRIES) { [int]$env:A_MAX_RETRIES } else { 3 }
+    $backoff = 1
+    $curlRc = 0
+    $http_code = ''
+    while ($true) {
+        Set-Content -LiteralPath $errFile -Value '' -NoNewline
+        Set-Content -LiteralPath $hdrFile -Value '' -NoNewline
+        # --output 让 curl 自己写响应体文件，绕过 PowerShell 管道的编码歧义
+        & $curl -sS --max-time $global:_A_R_TIMEOUT -D $hdrFile -K $hdrConfFile `
+            --data-binary "@$payloadFile" --output $bodyFile "$($global:_A_R_URL)/chat/completions" 2>$errFile
+        $curlRc = $LASTEXITCODE
+        $http_code = ''
+        $first = (Get-Content -LiteralPath $hdrFile -First 1 -ErrorAction SilentlyContinue)
+        if ($first) { $http_code = ($first -split '\s+')[1] }
+
+        $retry = $false; $reason = ''
+        if ($curlRc -ne 0) {
+            if (6, 7, 16, 18, 23, 26, 28, 35, 52, 55, 56 -contains $curlRc) { $retry = $true; $reason = "网络错误 (curl $curlRc)" }
+        } else {
+            if ($http_code -eq '429') { $retry = $true; $reason = 'HTTP 429 限流' }
+            elseif ($http_code -match '^5\d\d$') { $retry = $true; $reason = "HTTP $http_code 服务端错误" }
+        }
+        if (-not $retry) { break }
+        $attempt++
+        if ($attempt -gt $max_retries) { $attempt--; break }
+        $ra = ''
+        $m = Select-String -LiteralPath $hdrFile -Pattern '^\s*retry-after:\s*(\S+)' | Select-Object -First 1
+        if ($m) { $ra = $m.Matches[0].Groups[1].Value }
+        if (-not $ra) { $ra = "$backoff" }
+        Write-Host ("`r" + (' ' * 40) + "`r⏳ $reason，$ra 秒后重试 ($attempt/$max_retries)")
+        try { Start-Sleep -Seconds ([double]$ra) } catch { Start-Sleep -Seconds $backoff }
+        $backoff = $backoff * 2
+        Write-Host "`r🤖 重试中...  " -NoNewline
+    }
+    Write-Host ("`r" + (' ' * 40) + "`r") -NoNewline
+
+    $bodyOk = ($curlRc -eq 0) -and ($http_code -ne '429') -and ($http_code -notmatch '^5\d\d$') `
+        -and (Test-Path -LiteralPath $bodyFile) -and ((Get-Item -LiteralPath $bodyFile -ErrorAction SilentlyContinue).Length -gt 0)
+    if (-not $bodyOk) {
+        if ($attempt -gt 0) { Write-Host "⏳ 已自动重试 $attempt 次仍失败" }
+        $errout = ''
+        if (Test-Path -LiteralPath $errFile) { $errout += [System.IO.File]::ReadAllText($errFile, $global:_A_UTF8) }
+        if (Test-Path -LiteralPath $bodyFile) { $errout += [System.IO.File]::ReadAllText($bodyFile, $global:_A_UTF8) }
+        if ($errout.Length -gt 2000) { $errout = $errout.Substring(0, 2000) }
+        $emsg = _a_json_error $errout
+        if ($emsg) { _a_err "API 错误: $emsg" }
+        elseif ($curlRc -ne 0) { _a_err "请求失败 (curl 退出码 $curlRc)" }
+        elseif ($http_code -eq '429' -or $http_code -match '^5') { _a_err "API 错误 (HTTP $http_code): $errout" }
+        else { _a_err "无法解析响应: $errout" }
+        foreach ($f in $files) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+        return $false
+    }
+    $body = [System.IO.File]::ReadAllText($bodyFile, $global:_A_UTF8)
+    foreach ($f in $files) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+
+    $global:_A_AGENT_CONTENT = ''
+    $global:_A_AGENT_TOOL_CALLS = @()
+    $c = _a_json_content $body
+    if ($c) { $global:_A_AGENT_CONTENT = "$c" }
+    try {
+        $d = ConvertFrom-Json -InputObject $body
+        if ($d.choices -and $d.choices[0].message -and $d.choices[0].message.tool_calls) {
+            $global:_A_AGENT_TOOL_CALLS = @($d.choices[0].message.tool_calls)
+        }
+    } catch { }
+    if ($global:_A_AGENT_CONTENT -eq '' -and @($global:_A_AGENT_TOOL_CALLS).Count -eq 0) {
+        _a_err 'API 返回内容为空'
+        return $false
+    }
+    return $true
 }

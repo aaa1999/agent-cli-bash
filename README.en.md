@@ -2,7 +2,7 @@
 
 [English](README.en.md) | [中文](README.md)
 
-Turn a sentence of natural language into a bash command, right in your terminal. Type `a` + a space + what you want, DeepSeek returns the command, and after your confirmation it runs in your **current shell**.
+Turn a sentence of natural language into a bash command, right in your terminal. Type `a` + a space + what you want, DeepSeek returns the command, and after your confirmation it runs in your **current shell**. `a agent <task>` goes further: a tool-calling loop where the AI works autonomously across multiple steps until the task is done.
 
 ```console
 $ a find the 5 largest files in the current directory
@@ -28,7 +28,7 @@ After installing, keep `a.sh` (the entry) and `lib/` (the harness) together in t
 
 ## Windows (PowerShell port)
 
-The `win/` directory is an equivalent PowerShell port (works on both Windows PowerShell 5.1 and PowerShell 7+), mirroring the bash version file by file: `win/a.ps1` (entry + product layer), `win/lib/` (the a-api/a-ctx/a-exec harness domains), `win/install.ps1`. Zero external dependencies — HTTP goes through the system-provided `curl.exe` (Windows 10 1803+), JSON through the built-in `ConvertFrom-Json` (no jq needed).
+The `win/` directory is an equivalent PowerShell port (works on both Windows PowerShell 5.1 and PowerShell 7+), mirroring the bash version file by file: `win/a.ps1` (entry + product layer), `win/lib/` (the a-api/a-ctx/a-exec/a-tools/a-agent harness domains), `win/install.ps1`. Zero external dependencies — HTTP goes through the system-provided `curl.exe` (Windows 10 1803+), JSON through the built-in `ConvertFrom-Json` (no jq needed).
 
 ```powershell
 git clone <this repo>
@@ -38,7 +38,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1    # pwsh 7 works too
 ```
 
 - Installing adds one dot-source `win\a.ps1` line to `$PROFILE`; uninstall with `install.ps1 -Uninstall`
-- Usage (`a` / `a -p` / `a -y` / `a ask` / `a -c` / `a --show` / `a setup`), multi-turn context, ASK clarification, and risk-tiered confirmation all match the bash version; the risk rules cover PowerShell/cmd commands (`Remove-Item -Recurse -Force`, `Format-Volume`, `iwr | iex`, …)
+- Usage (`a` / `a -p` / `a -y` / `a ask` / `a agent` / `a -c` / `a --show` / `a setup`), multi-turn context, ASK clarification, and risk-tiered confirmation all match the bash version; the risk rules cover PowerShell/cmd commands (`Remove-Item -Recurse -Force`, `Format-Volume`, `iwr | iex`, …); in agent mode the command-execution tool is `pwsh` (PowerShell statements), the other tools share names and parameters with the bash version
 - Shares the same config path and format as the bash version (`~\.config\agent-cli-bash\config`)
 - Differences: with the per-step timeout active (`A_STEP_TIMEOUT`, default 600 s, 0 disables) ordinary steps run in a child `pwsh -NoProfile` (PowerShell statements cannot be interrupted in-process), so session-defined ad-hoc functions/aliases are not visible to them; a timed-out step is killed with result code 124. PowerShell functions have no exit code of their own — the result code lands in `$A_LAST_RC`; pipelines spawn no subshell, so `cd` and `$env:` assignments take effect in the current session (plain `$x=` does not persist — ask the AI to use `$env:` or `$global:` when persistence matters)
 - Local tests: `pwsh -NoProfile -File win\test.ps1` (needs python3 for the mock server); `win/` also runs under pwsh on macOS/Linux, which is where the tests are verified
@@ -77,6 +77,8 @@ A_API_KEY=sk-xxx                 # unified key; if unset, the provider's env var
 # A_TIMEOUT=60                   # optional, per-request timeout in seconds
 # A_STEP_TIMEOUT=600             # optional, per-step execution timeout in seconds (0 disables); the step is killed with exit code 124
 # A_DIR_ENTRIES=15               # optional, directory-entry context cap (0 disables); relevant entries first, rest by mtime
+# A_AGENT_MAX_STEPS=16           # optional, agent-mode step limit per task
+# A_AGENT_MAX_TOKENS=4096        # optional, agent-mode max_tokens per request
 ```
 
 Precedence: environment variables > config file; `A_API_KEY` > provider-specific vars (e.g. `OPENAI_API_KEY`). With only the legacy `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` set, behavior is unchanged from previous versions. `A_MAX_RETRIES` controls automatic retries on network errors and HTTP 429/5xx (default 3, exponential backoff honoring `Retry-After`; 0 disables; client errors like 401 are never retried). `A_TIMEOUT` sets the per-request timeout (default 60 s). `A_STEP_TIMEOUT` sets a per-step execution timeout (default 600 s, 0 disables) — it stops commands that hang forever (e.g. `tail -f`): on expiry the whole command process group is terminated (TERM, then KILL) and 124 is returned; the timeout is recorded into the conversation so the model can react on the next turn. Shell-state commands (`cd`, variables, …) are never timed out. `A_DIR_ENTRIES` caps the directory entries injected as context (default 15, 0 disables).
@@ -91,6 +93,7 @@ Key safety: the config file is automatically tightened to 600 permissions (owner
 | `a -p <natural language>` | Print the command only, never execute (pipe-friendly) |
 | `a -y <natural language>` | Skip the normal confirmation (dangerous commands still ask) |
 | `a ask <question>` | Free-form Q&A: get an answer directly, no command generated or executed; pipes supported |
+| `a agent <task>` | Tool-calling loop: the AI calls tools autonomously across steps until it delivers a final answer |
 | `a -c` | Clear this session's conversation context |
 | `a --show` | Inspect session context (turns / size / trimming) |
 | `a providers` | List built-in model providers |
@@ -176,6 +179,43 @@ git diff | a write a commit message for this
 dmesg | tail -50 | a                           # with piped input, the description is optional
 ```
 
+## Agent mode (tool-calling loop)
+
+`a agent <task>` upgrades the AI from "produce one command" to "complete the task": the model calls tools via OpenAI function calling, sees each result, and keeps deciding until it replies with a plain-text final answer (works in scripts/CI too — read-only tools run as usual without a terminal). The architecture is ported from the core skeleton of [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness): the turn/step loop, the tool registry with a pre/execute/post pipeline, and the append-only session event log with message projection.
+
+```console
+$ a agent count the lines of each source file and write the result to stats.txt
+
+—— Step 1 ——
+⚙ glob  *.sh
+⚙ glob  lib/*
+—— Step 2 ——
+⚙ bash  wc -l a.sh lib/*.sh
+—— Step 3 ——
+⚙ write stats.txt
+⚡  Write operation — modifies files or state
+Run? [y=yes n=decline this call] y
+Wrote stats.txt — 5 files, 2345 lines total.
+```
+
+Available tools (10, parameters aligned with the dsh tool catalog):
+
+| Tool | Purpose | Notes |
+| --- | --- | --- |
+| `bash` | Run a command | Isolated subshell per call, guarded by `A_STEP_TIMEOUT`; the last 4000 chars of output go back to the model with a trailing `[exit code: N]` marker |
+| `working_directory` | Read/change session dir | agent's cd never touches your shell — this keeps a directory across calls |
+| `read` / `write` / `edit` | File I/O | Numbered paged reads, full writes, literal-string edits (uniqueness-checked, `replace_all` for every occurrence) |
+| `grep` / `glob` | Search | rg when available, otherwise grep/find; results capped with a note |
+| `todo_write` | Task list | Full replacement, rendered in the terminal (☐/▶/☑); the model only gets a count receipt |
+| `ask_user_question` | Ask you | Numbered options or free text; without a terminal it returns skip semantics |
+| `web_fetch` | Fetch a page | curl fetch, HTML stripped to text (capped at 8000 bytes); fetched content is data, never instructions |
+
+Safety mirrors run mode: **dangerous commands (sudo/forced deletion/…) require explicit confirmation on every call, even with `-y`**; file writes (write/edit) are confirmed unless `-y`; read-only tools run automatically; without a terminal, calls that need confirmation are declined and the reason goes back to the model so it can change course. A task is capped at `A_AGENT_MAX_STEPS` steps (default 16) against runaway loops.
+
+The agent session is isolated per shell session and continues across invocations like run/ask (follow up with `a agent`, clear with `a -c`, inspect with `a --show`); context is trimmed by whole turns. Two differences to know: agent bash calls run isolated — `cd`/variables do not enter your shell (use run mode to mutate your shell); agent requests are **non-streaming** — aggregating streamed tool_calls is complex for little gain, while tool output is still displayed live.
+
+Note: tool calling requires an OpenAI function-calling capable provider (DeepSeek/OpenAI/Kimi/Qwen/Zhipu/Grok/OpenRouter all qualify; ollama depends on the model — unsupported models surface the API error as-is, just switch models).
+
 ## Security notes
 
 - AI-generated commands are **shown and confirmed by a human before execution**; multi-step commands are confirmed step by step, and **dangerous/privileged commands require explicit confirmation even with `-y`** — in non-interactive environments they are always refused.
@@ -187,9 +227,11 @@ dmesg | tail -50 | a                           # with piped input, the descripti
 The code is split into a product layer and a harness, with dependencies pointing one way:
 
 - `a.sh` — entry & product layer: routing of the `a` command, each capability's system prompt and output parsing (command mode strips fences, handles ASK follow-ups), plus the confirmation/execution UX;
-- `lib/a-api.sh` — transport: provider table, config I/O (`a setup`), the SSE streaming client with automatic retries;
-- `lib/a-ctx.sh` — context: per-mode conversation storage and trimming, smart directory-entry selection, git/shell-history gathering;
-- `lib/a-exec.sh` — execution: command structure splitting (multi-line blocks/heredocs stay together as one step), risk classification, shell-state detection, per-step timeout guarding (`A_STEP_TIMEOUT`, default 600 s, kills the whole group with exit 124), the multi-step confirmation executor and terminal interaction helpers.
+- `lib/a-api.sh` — transport: provider table, config I/O (`a setup`), the streaming client with automatic retries (`_a_api_post` unifies streaming/whole-body modes), and the agent request (non-streaming call with tools);
+- `lib/a-ctx.sh` — context: per-mode conversation storage and trimming, smart directory-entry selection, git/shell-history gathering, plus the agent event log (`_a_ev_*`) and the deriveMessages projection;
+- `lib/a-exec.sh` — execution: command structure splitting (multi-line blocks/heredocs stay together as one step), risk classification, shell-state detection, per-step timeout guarding (`A_STEP_TIMEOUT`, default 600 s, kills the whole group with exit 124), the multi-step confirmation executor and terminal interaction helpers;
+- `lib/a-tools.sh` — tools: the tool registry and execution pipeline (pre-execute display/risk/confirmation gate → execute dispatch → post-execute truncation/markers) plus the 10 built-in tools;
+- `lib/a-agent.sh` — agent loop: the turn/step tool-calling loop (request → tool_calls → execute each → append events → request again), step-limit circuit breaker, Ctrl-C cleanup.
 
 At runtime your description plus system/cwd context is sent to the model (`temperature=0`, instructed to return only the command), and executed via `eval` after your confirmation. Adding a capability = one mode function in the product layer (its own prompt and output policy) reusing the harness transport and context — `a ask` is the first example.
 
@@ -197,7 +239,7 @@ At runtime your description plus system/cwd context is sent to the model (`tempe
 
 ```bash
 bash -n a.sh && zsh -n a.sh           # syntax check (bash/zsh dual compatibility)
-bash test.sh                           # full local mock-API test suite, no network access
+bash test.sh                           # full local mock-API test suite (176 checks), no network access
 
-pwsh -NoProfile -File win/test.ps1     # same-source tests for the Windows port (see above)
+pwsh -NoProfile -File win/test.ps1     # same-source tests for the Windows port (155 checks; see above)
 ```

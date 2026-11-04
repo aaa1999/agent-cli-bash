@@ -37,6 +37,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1])
 retry_state = {"count": 0}
+agent_state = {}
+AGENT_WRITE_Y = "/tmp/a-agent-write-y.txt"
+AGENT_WRITE_N = "/tmp/a-agent-write-n.txt"
 
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -44,10 +47,104 @@ class H(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(n))
         msgs = body.get("messages", [])
         last_user = next((m["content"] for m in reversed(msgs) if m["role"] == "user"), "")
-        allc = " ".join(m["content"] for m in msgs)
+        allc = " ".join(m.get("content") or "" for m in msgs)
         auth = self.headers.get("Authorization", "")
         if "BADKEY" in auth or "AUTHFAIL" in last_user:
             code, obj = 401, {"error": {"message": "Authentication Fails (no such user)"}}
+        elif body.get("tools") is not None:
+            # ---- agent 模式: 非流式 + tool_calls（按标记词编排多步序列） ----
+            def tc(i, name, args):
+                return {"id": i, "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(args)}}
+            def seq(key, script):
+                st = agent_state.get(key, 0) + 1
+                agent_state[key] = st
+                return script[min(st - 1, len(script) - 1)]
+            msg = None
+            if "AGENTLOOPFOREVER" in last_user:
+                agent_state["LF"] = agent_state.get("LF", 0) + 1
+                msg = {"content": "", "tool_calls": [tc("cf_%d" % agent_state["LF"], "bash", {"command": "echo FOREVER"})]}
+            elif "AGENTLOOP2" in last_user:
+                msg = seq("L2", [
+                    {"content": "", "tool_calls": [tc("c2_1", "bash", {"command": "echo AGENT2_STEP1"})]},
+                    {"content": "AGENT2_DONE"},
+                ])
+            elif "AGENTSHOW" in last_user:
+                msg = seq("SH", [
+                    {"content": "", "tool_calls": [tc("cs_1", "bash", {"command": "echo AGENT_SHOW_STEP"})]},
+                    {"content": "AGENT_SHOW_DONE"},
+                ])
+            elif "AGENTCONFIRM" in last_user:
+                msg = seq("CF", [
+                    {"content": "", "tool_calls": [tc("cc_1", "write",
+                        {"file_path": "/tmp/a-agent-confirm.txt", "content": "confirmed-write"})]},
+                    {"content": "CONFIRM_DONE"},
+                ])
+            elif "AGENTLOOP" in last_user:
+                msg = seq("L1", [
+                    {"content": "", "tool_calls": [tc("call_1", "bash", {"command": "echo AGENT_STEP1"})]},
+                    {"content": "", "tool_calls": [tc("call_2", "bash", {"command": "echo AGENT_STEP2"})]},
+                    {"content": "AGENT_DONE"},
+                ])
+            elif "AGENTDANGER" in last_user:
+                msg = seq("DG", [
+                    {"content": "", "tool_calls": [tc("call_d", "bash", {"command": "rm -rf /tmp/a-agent-danger"})]},
+                    {"content": "DANGER_HANDLED"},
+                ])
+            elif "AGENTASK" in last_user:
+                msg = seq("AK", [
+                    {"content": "", "tool_calls": [tc("call_a", "ask_user_question",
+                        {"questions": [{"id": "q1", "question": "用哪个方案?",
+                                        "options": [{"label": "甲"}, {"label": "乙", "description": "保守"}]}]})]},
+                    {"content": "ASK_HANDLED" if '"answers"' in allc else "ASK_MISSING"},
+                ])
+            elif "AGENTTODO" in last_user:
+                msg = seq("TD", [
+                    {"content": "", "tool_calls": [tc("call_t", "todo_write",
+                        {"todos": [{"content": "第一步", "status": "completed"},
+                                   {"content": "第二步", "status": "in_progress"}]})]},
+                    {"content": "TODO_HANDLED" if "Updated todo list" in allc else "TODO_MISSING"},
+                ])
+            elif "AGENTWRITE" in last_user:
+                msg = seq("WY", [
+                    {"content": "", "tool_calls": [tc("call_w", "write",
+                        {"file_path": AGENT_WRITE_Y, "content": "written-by-agent"})]},
+                    {"content": "WRITE_HANDLED"},
+                ])
+            elif "AGENTDECLINE" in last_user:
+                msg = seq("WN", [
+                    {"content": "", "tool_calls": [tc("call_wn", "write",
+                        {"file_path": AGENT_WRITE_N, "content": "should-not-exist"})]},
+                    {"content": "DECLINE_HANDLED" if "declined" in allc else "DECLINE_MISSING"},
+                ])
+            elif "AGENTCTX" in last_user:
+                msg = {"content": "CTX_SEEN" if "AGENT_DONE" in allc else "CTX_MISSING"}
+            elif "AGENTSHEMA" in last_user:
+                names = sorted(t["function"]["name"] for t in body["tools"])
+                ok = (len(names) == 10 and body.get("tool_choice") == "auto" and body.get("stream") is False)
+                msg = {"content": "SCHEMA_OK" if ok else "SCHEMA_BAD:%s" % names}
+            elif "AGENTRETRY" in last_user:
+                st = agent_state.get("AR", 0) + 1
+                agent_state["AR"] = st
+                if st == 1:
+                    data = json.dumps({"error": {"message": "Insufficient Balance"}}).encode()
+                    self.send_response(429)
+                    self.send_header("retry-after", "1")
+                    self.send_header("content-type", "application/json")
+                    self.send_header("content-length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                msg = {"content": "RETRY_OK"}
+            else:
+                msg = {"content": "AGENT_DEFAULT"}
+            data = json.dumps({"choices": [{"message": msg, "finish_reason": "stop"}]}).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         else:
             nofence = False
             if "RATELIMIT" in last_user:
@@ -782,6 +879,239 @@ if command -v expect >/dev/null 2>&1; then
 else
     echo "  （未安装 expect，跳过 Ctrl-C 测试）"
 fi
+
+echo "== 5.5 工具域与事件日志单测 =="
+# 直连 harness: source 后直接调 _a_tool_dispatch / _a_ev_*（与 5.3/5.4 同风格）
+tool_call() { # tool_call <tool> <args_json> [env赋值...] → stdout
+    local t=$1 aj=$2
+    shift 2
+    T_NAME="$t" T_ARGS="$aj" env "$@" \
+        zsh -c "source '$REPO_DIR/a.sh'; _a_tool_dispatch \"\$T_NAME\" \"\$T_ARGS\"" 2>/dev/null
+}
+
+tmpd=$(mktemp -d)
+cd "$tmpd"
+printf 'l1\nl2\nl3\n' > sample.txt
+printf 'other\n' > other.log
+
+schemas=$(zsh -c "source '$REPO_DIR/a.sh'; _a_tools_schema_json" 2>/dev/null)
+check "工具注册表登记 10 个工具" "$(printf '%s' "$schemas" | grep -o '"name":"' | wc -l | tr -d ' ')" "10"
+printf '%s' "$schemas" | python3 -c "import json,sys; json.loads('['+sys.stdin.read()+']')" 2>/dev/null \
+    && ok "tools schema JSON 合法" || fail "tools schema JSON 合法"
+
+out=$(tool_call read '{"file_path":"sample.txt","limit":2}')
+check "read 带行号与续读页脚" "$out" '1: l1
+2: l2
+(Showing lines 1-2 of 3. Use offset=3 to continue.)'
+
+out=$(tool_call read '{"file_path":"no-such.txt"}')
+check "read 缺失文件报错" "$out" 'Error: file not found: no-such.txt'
+
+out=$(tool_call write '{"file_path":"sub/w.txt","content":"line1\nline2\n"}')
+check "write 返回 OK" "$out" 'OK: wrote sub/w.txt'
+printf 'line1\nline2\n' > expected.bin
+if cmp -s sub/w.txt expected.bin; then
+    ok "write 内容字节精确（含尾部换行）"
+else
+    fail "write 内容字节精确 (实际: $(xxd sub/w.txt | head -2))"
+fi
+
+out=$(tool_call edit '{"file_path":"sample.txt","old_string":"l2","new_string":"L2"}')
+check "edit 唯一替换" "$out" 'OK: replaced 1 occurrence(s) in sample.txt'
+check "edit 结果落盘" "$(sed -n 2p sample.txt)" 'L2'
+out=$(tool_call edit '{"file_path":"sample.txt","old_string":"l","new_string":"x"}')
+check "edit 多处未开 replace_all 报错" "$out" 'Error: old_string appears 2 times in sample.txt; provide a longer unique string or set replace_all=true'
+out=$(tool_call edit '{"file_path":"sample.txt","old_string":"l","new_string":"x","replace_all":true}')
+check "edit replace_all 全替换" "$(head -1 sample.txt)" 'x1'
+
+out=$(tool_call grep '{"pattern":"L2"}')
+check "grep 命中带行号" "$out" './sample.txt:2:L2'
+out=$(tool_call grep '{"pattern":"nomatchhere"}')
+check "grep 无命中提示" "$out" '(no matches)'
+out=$(tool_call grep '{"pattern":"other","include":"*.log"}')
+check "grep include 过滤" "$out" './other.log:1:other'
+
+out=$(tool_call glob '{"pattern":"*.txt"}')
+if printf '%s\n' "$out" | grep -qx '\./sample.txt'; then
+    ok "glob 命中文件"
+else
+    fail "glob 命中文件 (实际: $out)"
+fi
+
+out=$(tool_call bash '{"command":"echo hi; exit 3"}')
+check "bash 输出与退出码标记" "$out" 'hi
+[exit code: 3]'
+
+out=$(A_STEP_TIMEOUT=1 tool_call bash '{"command":"sleep 5"}')
+if printf '%s' "$out" | grep -q '^\[timed out after 1s and terminated\]$' && printf '%s' "$out" | grep -q '\[exit code: 124\]'; then
+    ok "bash 超时标记与 124"
+else
+    fail "bash 超时标记与 124 (实际: $out)"
+fi
+
+out=$(printf '' | zsh -c "source '$REPO_DIR/a.sh'; _a_tool_execute 1 bash '{\"command\":\"head -c 6000 /dev/zero | tr \\\"\\\\\\\\0\\\" A\"}'" 2>/dev/null)
+if printf '%s' "$out" | grep -q 'output truncated, showing last 4000 chars' && [[ ${#out} -lt 4200 ]]; then
+    ok "bash 超长输出截尾（管线 post-execute）"
+else
+    fail "bash 超长输出截尾 (长度: ${#out})"
+fi
+
+out=$(tool_call bash '{"command":"pwd"}')
+check "bash 在会话工作目录执行" "$out" "$tmpd
+[exit code: 0]"
+out=$(tool_call working_directory '{"cd":"sub"}')
+check "working_directory 切换(返回绝对路径)" "$out" "working directory set to: $tmpd/sub"
+out=$(zsh -c "source '$REPO_DIR/a.sh'; _A_AGENT_CWD=/tmp _a_tool_dispatch bash '{\"command\":\"pwd\"}'" 2>/dev/null)
+check "bash 默认用会话目录(非调用处 cwd)" "$out" '/tmp
+[exit code: 0]'
+
+out=$(tool_call todo_write '{"todos":[{"content":"t1","status":"completed"},{"content":"t2","status":"in_progress"},{"content":"t3","status":"pending"}]}' 2>/dev/null)
+check "todo 计数回执" "$out" 'Updated todo list: 1 pending, 1 in progress, 1 completed.'
+out=$(tool_call todo_write '{"todos":[{"content":"a","status":"in_progress"},{"content":"b","status":"in_progress"}]}' 2>/dev/null)
+check "todo 多个 in_progress 报错" "$out" 'Error: at most one todo may be in_progress (got 2)'
+
+out=$(printf '' | zsh -c "source '$REPO_DIR/a.sh'; _a_tool_dispatch ask_user_question '{\"questions\":[{\"id\":\"q1\",\"question\":\"选哪个?\",\"options\":[{\"label\":\"A\"},{\"label\":\"B\"}]}]}'" 2>/dev/null)
+check "ask_user 无终端返回跳过语义" "$out" '{"answers":[{"id":"q1","selected":[],"custom":"(skipped: no terminal available)"}]}'
+
+# 管线: 拒绝路径与未知工具
+out=$(printf '' | zsh -c "source '$REPO_DIR/a.sh'; _a_tool_execute 0 write '{\"file_path\":\"declined.txt\",\"content\":\"x\"}'" 2>/dev/null)
+check "无终端时写文件被拒并回传文本" "$out" '[user declined this tool call]'
+[[ -e declined.txt ]] && fail "被拒调用未落盘" || ok "被拒调用未落盘"
+out=$(printf '' | zsh -c "source '$REPO_DIR/a.sh'; _a_tool_execute 1 nosuch '{}'" 2>/dev/null)
+check "未知工具报错" "$out" 'Error: unknown tool: nosuch'
+
+# 事件日志: append → derive 投影（消息形状逐条校验）
+ev_out=$(zsh -c "
+source '$REPO_DIR/a.sh'
+_a_ev_append t U '{\"role\":\"user\",\"content\":\"任务: A\"}'
+_a_ev_append t A '{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]}'
+_a_ev_append t T '{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"out\"}'
+_a_ev_append t U '{\"role\":\"user\",\"content\":\"任务: B\"}'
+_a_ev_append t A '{\"role\":\"assistant\",\"content\":\"done\"}'
+_a_ev_derive t" 2>/dev/null)
+shape=$(printf '%s' "$ev_out" | python3 -c '
+import json, sys
+m = json.loads("[" + sys.stdin.read().strip() + "]")
+print(";".join(x["role"] for x in m),
+      m[1]["tool_calls"][0]["id"],
+      m[2]["tool_call_id"], m[2]["content"],
+      m[4]["content"])' 2>/dev/null)
+check "derive 投影消息形状(含 tool_calls 原样回放)" "$shape" 'user;assistant;tool;user;assistant c1 c1 out done'
+
+trimmed=$(A_MAX_CONTEXT_CHARS=120 zsh -c '
+source "'"$REPO_DIR"'/a.sh"
+for i in 1 2 3 4 5; do
+    _a_ev_append t U "{\"role\":\"user\",\"content\":\"任务: U$i PADPADPADPADPADPAD\"}"
+    _a_ev_append t A "{\"role\":\"assistant\",\"content\":\"回答$i PADPADPADPADPADPAD\"}"
+done
+_a_ev_derive t' 2>/dev/null)
+n=$(printf '%s' "$trimmed" | python3 -c 'import json,sys; m=json.loads("["+sys.stdin.read().strip()+"]"); print(len(m), m[0]["content"].split()[1], m[-1]["content"].split()[0])' 2>/dev/null)
+check "超预算按完整轮裁剪" "$n" "2 U5 回答5"
+
+cd "$REPO_DIR"
+
+echo "== 5.6 agent 模式全链路（mock） =="
+export DEEPSEEK_API_KEY=sk-test DEEPSEEK_BASE_URL="$URL"
+
+rc=0
+out=$(env A_STEP_TIMEOUT=30 zsh -c "source '$REPO_DIR/a.sh'; a agent 'AGENTLOOP 测试'" 2>/dev/null) || rc=$?
+check "zsh agent 多步工具循环到最终回答" "$rc - $out" '0 - AGENT_DONE'
+
+rc=0
+out=$(env A_STEP_TIMEOUT=30 bash -c "source '$REPO_DIR/a.sh'; a agent 'AGENTLOOP2 测试'" 2>/dev/null) || rc=$?
+check "bash agent 工具循环" "$rc - $out" '0 - AGENT2_DONE'
+
+rc=0
+out=$(env A_STEP_TIMEOUT=30 zsh -c "source '$REPO_DIR/a.sh'; a agent 'AGENTSHOW 测试'" 2>&1) || rc=$?
+if [[ $rc -eq 0 ]] && printf '%s' "$out" | grep -q AGENT_SHOW_STEP && printf '%s' "$out" | grep -q AGENT_SHOW_DONE; then
+    ok "agent 工具输出实时展示"
+else
+    fail "agent 工具输出实时展示 (实际: $out)"
+fi
+
+rc=0
+out=$(env A_STEP_TIMEOUT=30 zsh -c "source '$REPO_DIR/a.sh'; a agent 'AGENTSHEMA 校验'" 2>/dev/null) || rc=$?
+check "请求携带 10 工具/tool_choice=auto/非流式" "$rc - $out" '0 - SCHEMA_OK'
+
+rc=0
+out=$(env A_STEP_TIMEOUT=30 zsh -c "source '$REPO_DIR/a.sh'; a agent 'AGENTLOOP 测试' >/dev/null 2>&1; a agent 'AGENTCTX 续聊'" 2>/dev/null) || rc=$?
+check "agent 会话多轮续接（事件日志携带上轮）" "$rc - $out" '0 - CTX_SEEN'
+
+out=$(env A_STEP_TIMEOUT=30 zsh -c "source '$REPO_DIR/a.sh'; a agent 'AGENTCTX 测试' >/dev/null 2>&1; a --show" 2>/dev/null)
+if printf '%s' "$out" | grep -q '\[agent\]' && printf '%s' "$out" | grep -q '轮 1'; then
+    ok "--show 渲染 agent 事件视图"
+else
+    fail "--show 渲染 agent 事件视图 (实际: $out)"
+fi
+
+out=$(env A_STEP_TIMEOUT=30 zsh -c "source '$REPO_DIR/a.sh'; a agent 'AGENTLOOP 测试' >/dev/null 2>&1; a -c; a agent 'AGENTCTX 测试'" 2>/dev/null)
+check "a -c 清空 agent 事件日志" "$out" "CTX_MISSING"
+
+rc=0
+out=$(env A_STEP_TIMEOUT=30 zsh -c "source '$REPO_DIR/a.sh'; a agent 'AGENTDANGER 测试'" </dev/null 2>&1) || rc=$?
+if [[ $rc -eq 0 ]] && printf '%s' "$out" | grep -q DANGER_HANDLED; then
+    ok "无终端时高危工具调用被拒且循环继续"
+else
+    fail "无终端时高危工具调用被拒且循环继续 (rc=$rc, 实际: $out)"
+fi
+if printf '%s' "$out" | grep -q '已拒绝本次工具调用'; then
+    ok "拒绝提示展示"
+else
+    fail "拒绝提示展示 (实际: $out)"
+fi
+
+rc=0
+out=$(env A_STEP_TIMEOUT=30 zsh -c "source '$REPO_DIR/a.sh'; a agent 'AGENTASK 测试'" </dev/null 2>/dev/null) || rc=$?
+check "ask_user 无终端跳过后循环继续" "$rc - $out" '0 - ASK_HANDLED'
+
+rc=0
+out=$(env A_STEP_TIMEOUT=30 zsh -c "source '$REPO_DIR/a.sh'; a agent 'AGENTTODO 测试'" 2>&1) || rc=$?
+if [[ $rc -eq 0 ]] && printf '%s' "$out" | grep -q TODO_HANDLED; then
+    ok "todo_write 全链路"
+else
+    fail "todo_write 全链路 (rc=$rc, 实际: $out)"
+fi
+if printf '%s' "$out" | grep -q '任务清单' && printf '%s' "$out" | grep -q '第二步'; then
+    ok "todo 清单渲染"
+else
+    fail "todo 清单渲染 (实际: $out)"
+fi
+
+rm -f /tmp/a-agent-write-y.txt /tmp/a-agent-write-n.txt
+rc=0
+out=$(env A_STEP_TIMEOUT=30 zsh -c "source '$REPO_DIR/a.sh'; a -y agent 'AGENTWRITE 测试'" </dev/null 2>/dev/null) || rc=$?
+check "-y 写文件自动放行并完成" "$rc - $out - $(cat /tmp/a-agent-write-y.txt 2>/dev/null)" '0 - WRITE_HANDLED - written-by-agent'
+
+rc=0
+out=$(env A_STEP_TIMEOUT=30 zsh -c "source '$REPO_DIR/a.sh'; a agent 'AGENTDECLINE 测试'" </dev/null 2>/dev/null) || rc=$?
+check "无终端写文件被拒、拒因回传模型" "$rc - $out" '0 - DECLINE_HANDLED'
+[[ -e /tmp/a-agent-write-n.txt ]] && fail "被拒写调用未落盘" || ok "被拒写调用未落盘"
+
+rc=0
+out=$(env A_AGENT_MAX_STEPS=2 A_STEP_TIMEOUT=30 zsh -c "source '$REPO_DIR/a.sh'; a agent 'AGENTLOOPFOREVER 测试'" 2>&1) || rc=$?
+check "步数上限熔断" "$rc - $(printf '%s' "$out" | grep -c '步数上限')" "1 - 1"
+
+rc=0
+out=$(env A_STEP_TIMEOUT=30 zsh -c "source '$REPO_DIR/a.sh'; a agent 'AGENTRETRY 测试'" 2>/dev/null) || rc=$?
+check "agent 请求 429 自动重试(整包模式)" "$rc - $out" '0 - RETRY_OK'
+
+rc=0
+out=$(env A_STEP_TIMEOUT=30 zsh -c "source '$REPO_DIR/a.sh'; a -p agent '某任务'" 2>/dev/null) || rc=$?
+check "agent 不支持 -p" "$rc" "2"
+
+# 交互确认（伪终端）: 写文件工具 y 执行
+if command -v expect >/dev/null 2>&1; then
+    rm -f /tmp/a-agent-confirm.txt
+    A_TEST_CMD="source '$REPO_DIR/a.sh'; a agent 'AGENTCONFIRM 测试'" expect -c '
+        set timeout 10
+        spawn zsh -c $env(A_TEST_CMD)
+        expect "执行?"
+        send "y\r"
+        expect eof
+    ' >/dev/null 2>&1
+    check "expect: y 确认后写文件执行" "$(cat /tmp/a-agent-confirm.txt 2>/dev/null)" "confirmed-write"
+fi
+rm -f /tmp/a-agent-write-y.txt /tmp/a-agent-write-n.txt /tmp/a-agent-danger /tmp/a-agent-confirm.txt
 
 echo "== 6. install.sh 安装/卸载 =="
 TMPHOME=$(mktemp -d)

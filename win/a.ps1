@@ -5,6 +5,7 @@
 #   a -p <自然语言>     只生成并打印命令，不执行
 #   a -y <自然语言>     生成后直接执行，不询问（谨慎）
 #   a ask <问题>        自由问答：直接给答案，不生成/执行命令
+#   a agent <任务>      工具调用循环：AI 自主多步执行直到完成任务
 #   a -c                清空本会话的多轮对话上下文
 #
 # 多轮: 同一 PowerShell 会话内，之前的问答、生成的命令、执行结果（退出码+输出尾部）、
@@ -17,8 +18,11 @@
 # 兼容 Windows PowerShell 5.1 与 PowerShell 7+；依赖系统自带 curl.exe，无需 jq。
 #
 # 结构: 本文件是入口与产品层（prompt/输出解析/UX）；通用 harness 在 lib/ 下——
-#   lib/a-api.ps1  传输域（提供商/配置/SSE 客户端）  lib/a-ctx.ps1  上下文域（会话/环境采集）
-#   lib/a-exec.ps1 执行域（风险/确认执行）
+#   lib/a-api.ps1   传输域（提供商/配置/SSE 客户端）
+#   lib/a-ctx.ps1   上下文域（会话/环境采集/agent 事件日志）
+#   lib/a-exec.ps1  执行域（风险/确认执行）
+#   lib/a-tools.ps1 工具域（工具注册表/执行管线）
+#   lib/a-agent.ps1 agent 循环域（turn/step 工具调用循环）
 # 仓库需整体携带（a.ps1 与 lib/ 同级），$PROFILE 里只需一行 dot-source 本文件。
 #
 # 与 bash 版的差异: PowerShell 函数没有独立退出码，a 的执行结果码在 $A_LAST_RC；
@@ -32,11 +36,13 @@ $global:A_VERSION = '0.5.0'
 . (Join-Path $PSScriptRoot 'lib/a-api.ps1')
 . (Join-Path $PSScriptRoot 'lib/a-ctx.ps1')
 . (Join-Path $PSScriptRoot 'lib/a-exec.ps1')
+. (Join-Path $PSScriptRoot 'lib/a-tools.ps1')
+. (Join-Path $PSScriptRoot 'lib/a-agent.ps1')
 
 # ---------- 产品层 ----------
 
-# 能力模式表: 每个模式一条独立会话（_A_CONV 里按模式分键），a -c 全部清空
-$global:_A_MODES = @('run', 'ask')
+# 能力模式表: 每个模式一条独立会话（run/ask 用 _A_CONV，agent 用 _A_EV），a -c 全部清空
+$global:_A_MODES = @('run', 'ask', 'agent')
 
 # 清理 AI 返回内容：去掉 markdown 代码围栏行与空行
 function _a_clean([string]$s) {
@@ -61,6 +67,7 @@ a —— 自然语言转 PowerShell 命令（agent-cli-bash · Windows 版）
   a -p <自然语言>    只打印命令，不执行
   a -y <自然语言>    生成后直接执行，不询问（谨慎使用）
   a ask <问题>       自由问答：直接回答，不生成/执行命令（支持管道输入）
+  a agent <任务>     工具调用循环：AI 自主多步执行直到完成任务（支持管道输入）
   a -c               清空本会话的多轮对话上下文
   a --show           查看当前会话的上下文构成（轮次/体积/裁剪情况）
   a -h | --help      显示帮助
@@ -70,6 +77,16 @@ a —— 自然语言转 PowerShell 命令（agent-cli-bash · Windows 版）
 
 确认时: y=执行  n=不执行(码130)  i=忽略(码0)  直接回车等同 n
 执行结果码写入 $A_LAST_RC（PowerShell 函数没有独立退出码）。
+
+agent 模式（工具调用循环）:
+  AI 通过调用工具自主完成任务: pwsh(执行命令)、read/write/edit(文件)、grep/glob(搜索)、
+  working_directory(切换会话目录)、todo_write(任务清单)、ask_user_question(向你提问)、
+  web_fetch(抓取网页)，循环"调用工具→看结果→继续"直到给出最终回答。
+  每次 pwsh/写文件调用仍走风险分级确认: 高危恒确认（即使 -y）、写操作无 -y 时确认、
+  只读工具自动放行；无终端时需确认的调用一律拒绝并把原因回传给 AI。
+  单次任务最多 A_AGENT_MAX_STEPS 步(默认 16)；上下文按轮次裁剪(a -c 清空)。
+  注意: agent 的 pwsh 每次调用在独立子进程，cd/变量不进入你的会话；需要改动当前
+  会话请用普通 run 模式。agent 步骤为非流式请求（工具调用的流式聚合代价高，见 README）。
 
 多步执行:
   AI 返回多行命令时按完整 PowerShell 结构切成步骤(跨行的 foreach/if/函数体、
@@ -114,6 +131,8 @@ a —— 自然语言转 PowerShell 命令（agent-cli-bash · Windows 版）
   A_TIMEOUT          单次 API 请求超时秒数，默认 60
   A_STEP_TIMEOUT     单步命令执行超时秒数，默认 600（0=禁用）；超时终止该步，结果码 124
   A_DIR_ENTRIES      目录条目注入上限，默认 15（0=不注入）；超出时相关的优先、其余按修改时间
+  A_AGENT_MAX_STEPS  agent 模式单次任务步数上限，默认 16
+  A_AGENT_MAX_TOKENS agent 模式单步请求 max_tokens，默认 4096
 
 示例:
   a 找出当前目录下最大的 5 个文件
@@ -140,7 +159,7 @@ function a {
                 '--providers' { _a_list_providers; return }
                 '--setup'    { _a_setup; return }
                 '--show'     { _a_show $global:_A_MODES; return }
-                '--clear'    { foreach ($m in $global:_A_MODES) { _a_conv_clear $m }
+                '--clear'    { foreach ($m in $global:_A_MODES) { _a_conv_clear $m; _a_ev_clear $m }
                                Write-Host '已清空本会话的对话上下文'; return }
                 default      { _a_err "未知选项 $tok（try: a -h）"; $global:A_LAST_RC = 2; return }
             }
@@ -149,7 +168,7 @@ function a {
                 switch ($ch) {
                     'p' { $printOnly = 1 }
                     'y' { $autoYes = 1 }
-                    'c' { foreach ($m in $global:_A_MODES) { _a_conv_clear $m }
+                    'c' { foreach ($m in $global:_A_MODES) { _a_conv_clear $m; _a_ev_clear $m }
                           Write-Host '已清空本会话的对话上下文'; return }
                     'h' { _a_help; return }
                     default { _a_err "未知选项 -$ch（try: a -h）"; $global:A_LAST_RC = 2; return }
@@ -189,6 +208,19 @@ function a {
         $query = (($words | Select-Object -Skip 1) -join ' ')
         if (-not $query) { $query = '分析以上管道输入，回答其中的问题' }
         _a_mode_ask $query $stdin_data
+        return
+    }
+
+    # 子命令: a agent <任务> —— 工具调用循环（多步自主完成任务，详见 _a_help）
+    if ($words.Count -gt 0 -and $words[0] -eq 'agent') {
+        $query = (($words | Select-Object -Skip 1) -join ' ')
+        if (-not $query) { $query = '分析以上管道输入并完成任务' }
+        if ($printOnly -eq 1) {
+            _a_err 'agent 模式不支持 -p（它需要实际执行工具）'
+            $global:A_LAST_RC = 2
+            return
+        }
+        _a_agent $query $stdin_data $autoYes
         return
     }
 

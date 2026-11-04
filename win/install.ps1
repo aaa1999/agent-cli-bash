@@ -81,6 +81,8 @@ A_API_KEY=
 # A_TIMEOUT=60               # 单次 API 请求超时秒数
 # A_STEP_TIMEOUT=600         # 单步命令执行超时秒数（0=禁用）；超时终止该步，结果码 124
 # A_DIR_ENTRIES=15           # 目录条目注入上限（0=不注入）；超出时相关的优先、其余按修改时间
+# A_AGENT_MAX_STEPS=16       # agent 模式单次任务步数上限
+# A_AGENT_MAX_TOKENS=4096    # agent 模式单步请求 max_tokens
 '@
     [System.IO.File]::WriteAllText($configFile, $tpl, (New-Object System.Text.UTF8Encoding($true)))
     Write-Output "已生成配置模板 $configFile（记得填入 A_API_KEY）"

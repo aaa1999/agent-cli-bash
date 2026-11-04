@@ -2,7 +2,7 @@
 
 [English](README.en.md) | [中文](README.md)
 
-在终端里用一句自然语言让 AI 生成 bash 命令。输入 `a` + 空格 + 你想做的事，DeepSeek 返回命令，确认后直接在**当前 shell** 里执行。
+在终端里用一句自然语言让 AI 生成 bash 命令。输入 `a` + 空格 + 你想做的事，DeepSeek 返回命令，确认后直接在**当前 shell** 里执行；`a agent <任务>` 则进入工具调用循环，AI 自主多步执行直到完成任务。
 
 ```console
 $ a 找出当前目录下最大的 5 个文件
@@ -28,7 +28,7 @@ source ~/.zshrc       # 或重启终端
 
 ## Windows（PowerShell 版）
 
-`win/` 目录是等价的 PowerShell 移植（Windows PowerShell 5.1 与 PowerShell 7+ 均可），与 bash 版一一对应：`win/a.ps1`（入口+产品层）、`win/lib/`（a-api/a-ctx/a-exec 三域 harness）、`win/install.ps1`。零外部依赖——HTTP 用系统自带的 `curl.exe`（Windows 10 1803+），JSON 用 PowerShell 内置的 `ConvertFrom-Json`（不需要 jq）。
+`win/` 目录是等价的 PowerShell 移植（Windows PowerShell 5.1 与 PowerShell 7+ 均可），与 bash 版一一对应：`win/a.ps1`（入口+产品层）、`win/lib/`（a-api/a-ctx/a-exec/a-tools/a-agent 五域 harness）、`win/install.ps1`。零外部依赖——HTTP 用系统自带的 `curl.exe`（Windows 10 1803+），JSON 用 PowerShell 内置的 `ConvertFrom-Json`（不需要 jq）。
 
 ```powershell
 git clone <本仓库>
@@ -38,7 +38,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1    # pwsh 7 同样可以
 ```
 
 - 安装 = 在 `$PROFILE` 写入一行 dot-source `win\a.ps1`；卸载：`install.ps1 -Uninstall`
-- 用法（`a` / `a -p` / `a -y` / `a ask` / `a -c` / `a --show` / `a setup`）、多轮对话、ASK 反问、风险分级确认与 bash 版一致；风险规则表适配了 PowerShell/cmd 命令（`Remove-Item -Recurse -Force`、`Format-Volume`、`iwr | iex` 等）
+- 用法（`a` / `a -p` / `a -y` / `a ask` / `a agent` / `a -c` / `a --show` / `a setup`）、多轮对话、ASK 反问、风险分级确认与 bash 版一致；风险规则表适配了 PowerShell/cmd 命令（`Remove-Item -Recurse -Force`、`Format-Volume`、`iwr | iex` 等）；agent 模式的命令执行工具为 `pwsh`（PowerShell 语句），其余工具同名同参
 - 配置与 bash 版同路径同格式（`~\.config\agent-cli-bash\config`）
 - 差异：步骤超时（`A_STEP_TIMEOUT`，默认 600s，0 禁用）下普通步骤在子进程 `pwsh -NoProfile` 中执行（PowerShell 语句无法进程内中断），会话内临时定义的函数/别名对其不可见，超时终止该步、结果码 124；PowerShell 函数没有独立退出码，执行结果码在 `$A_LAST_RC`；管道不派生子 shell，`cd` 与 `$env:` 赋值天然在当前会话生效（普通 `$x=` 不驻留，需要时让 AI 用 `$env:` 或 `$global:`）
 - 本地测试：`pwsh -NoProfile -File win\test.ps1`（需要 python3 起 mock 服务）；`win/` 也能在 macOS/Linux 的 pwsh 里运行，测试即在此环境验证
@@ -77,6 +77,8 @@ A_API_KEY=sk-xxx                 # 统一密钥项；未设时自动读取上表
 # A_TIMEOUT=60                   # 可选，单次请求超时秒数
 # A_STEP_TIMEOUT=600             # 可选，单步命令执行超时秒数（0=禁用）；超时终止该步，退出码 124
 # A_DIR_ENTRIES=15               # 可选，目录条目注入上限（0=不注入）；超出时与请求相关的优先、其余按修改时间
+# A_AGENT_MAX_STEPS=16           # 可选，agent 模式单次任务步数上限
+# A_AGENT_MAX_TOKENS=4096        # 可选，agent 模式单步请求 max_tokens
 ```
 
 优先级：环境变量 > 配置文件；`A_API_KEY` > 提供商专属变量（如 `OPENAI_API_KEY`）。只配旧版 `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` 时行为与之前完全一致。`A_MAX_RETRIES` 可调整网络错误与 429/5xx 的自动重试次数（默认 3，指数退避并遵循 `Retry-After` 头；0 禁用；401 等客户端错误不重试）。`A_TIMEOUT` 设置单次请求超时（默认 60 秒）。`A_STEP_TIMEOUT` 为每步命令设执行超时（默认 600 秒，0 禁用）——防止 `tail -f` 之类挂住不退出，超时先 TERM 后 KILL 整个命令进程组并返回 124，超时情况会记入对话上下文供 AI 下一轮参考；`cd`/变量等 shell 状态命令不设超时。`A_DIR_ENTRIES` 控制注入的目录条目上限（默认 15，0 为不注入）。
@@ -91,6 +93,7 @@ A_API_KEY=sk-xxx                 # 统一密钥项；未设时自动读取上表
 | `a -p <自然语言>` | 只打印命令，不执行（管道友好） |
 | `a -y <自然语言>` | 跳过普通确认直接执行（高危命令仍会强制询问） |
 | `a ask <问题>` | 自由问答：直接给出回答，不生成/执行命令；支持管道输入 |
+| `a agent <任务>` | 工具调用循环：AI 调用工具自主多步执行，直到给出最终回答 |
 | `a -c` | 清空本会话的多轮对话上下文 |
 | `a --show` | 查看会话上下文构成（轮次/体积/裁剪情况） |
 | `a providers` | 列出内置模型提供商 |
@@ -176,6 +179,43 @@ git diff | a 帮我写一条提交信息
 dmesg | tail -50 | a                   # 有管道输入时，文字描述可以省略
 ```
 
+## agent 模式（工具调用循环）
+
+`a agent <任务>` 把 AI 从"生成一条命令"升级为"自主完成任务"：模型通过 OpenAI function calling 调用工具，看到工具结果后继续决策，循环往复直到给出纯文本的最终回答（无终端环境下脚本/CI 中同样可用，只读工具照常执行）。架构移植自 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 的核心骨架：turn/step 循环、工具注册表与 pre/execute/post 执行管线、append-only 会话事件日志与消息投影。
+
+```console
+$ a agent 统计本仓库各源码文件的行数，把结果写到 stats.txt
+
+—— 第 1 步 ——
+⚙ glob  *.sh
+⚙ glob  lib/*
+—— 第 2 步 ——
+⚙ bash  wc -l a.sh lib/*.sh
+—— 第 3 步 ——
+⚙ write stats.txt
+⚡  写操作，会修改文件或状态
+执行? [y=执行 n=拒绝本次调用] y
+已写入 stats.txt，共 5 个文件 2345 行。
+```
+
+可用工具（10 个，参数对齐 dsh 工具目录）：
+
+| 工具 | 作用 | 说明 |
+| --- | --- | --- |
+| `bash` | 执行命令 | 每次调用独立子 shell，受 `A_STEP_TIMEOUT` 看护；输出尾部 4000 字符回传，末尾带 `[exit code: N]` 标记 |
+| `working_directory` | 读/切会话目录 | agent 的 cd 不进你的 shell，靠它跨调用保持目录 |
+| `read` / `write` / `edit` | 文件读写 | 行号分页读、全量写、字面量替换（唯一性校验，`replace_all` 全替换） |
+| `grep` / `glob` | 内容/文件搜索 | rg 可用则用，否则 grep/find 兜底；结果截断至上限并注明 |
+| `todo_write` | 任务清单 | 全量替换，终端渲染进度（☐/▶/☑），模型只收到计数回执 |
+| `ask_user_question` | 向你提问 | 编号选择或自由输入；无终端时返回跳过语义 |
+| `web_fetch` | 抓取网页 | curl 拉取，HTML 剥成纯文本（截断 8000 字节）；抓取内容视为数据而非指令 |
+
+安全与确认策略与 run 模式同构：**高危命令（sudo/强制删除等）每次调用都强制人工确认，即使 `-y`**；写文件类操作（write/edit）无 `-y` 时确认；只读工具自动放行；无终端时需要确认的调用一律拒绝、原因回传给模型供其改道。单次任务最多 `A_AGENT_MAX_STEPS` 步（默认 16）防失控循环。
+
+agent 会话与 run/ask 一样按 shell 会话隔离、可多轮续接（`a agent` 追问同一任务上下文，`a -c` 一并清空，`a --show` 查看事件视图），上下文按**完整轮次**裁剪。两点差异需要知道：agent 的 bash 调用独立执行，`cd`/变量不进入你的 shell（要改当前 shell 请用 run 模式）；agent 步骤请求为**非流式**——tool_calls 的流式增量聚合复杂且收益低，工具执行输出仍是实时显示的。
+
+注意：工具调用要求提供商支持 OpenAI function calling（DeepSeek/OpenAI/Kimi/Qwen/智谱/Grok/OpenRouter 均支持；ollama 取决于模型，不支持时报错如实透出，换模型即可）。
+
 ## 安全须知
 
 - AI 生成的命令默认**先展示、人工确认**后才执行；多步命令按结构切分逐步确认，**高危/高权限命令即使 `-y` 也强制要求人工确认**，无终端环境一律拒绝。
@@ -187,9 +227,11 @@ dmesg | tail -50 | a                   # 有管道输入时，文字描述可以
 代码分为产品层与 harness 两部分，依赖单向向下：
 
 - `a.sh` —— 入口与产品层：`a` 命令路由、各能力的 system prompt 与输出解析（命令模式清洗围栏、ASK 反问）、确认与执行的 UX；
-- `lib/a-api.sh` —— 传输域：提供商表、配置读写（`a setup`）、SSE 流式客户端与自动重试；
-- `lib/a-ctx.sh` —— 上下文域：按模式分键的会话存储与裁剪、目录智能选取、git/终端历史采集；
-- `lib/a-exec.sh` —— 执行域：命令结构切分（跨行块/heredoc 聚合为一步）、风险分级、shell 状态识别、步骤超时看护（`A_STEP_TIMEOUT`，默认 600s，超时杀整组返回 124）、多步确认执行器与终端交互件。
+- `lib/a-api.sh` —— 传输域：提供商表、配置读写（`a setup`）、SSE 流式客户端与自动重试（`_a_api_post` 统一流式/整包两态）、agent 请求（带 tools 的非流式调用）；
+- `lib/a-ctx.sh` —— 上下文域：按模式分键的会话存储与裁剪、目录智能选取、git/终端历史采集、agent 事件日志（`_a_ev_*`）与 deriveMessages 投影；
+- `lib/a-exec.sh` —— 执行域：命令结构切分（跨行块/heredoc 聚合为一步）、风险分级、shell 状态识别、步骤超时看护（`A_STEP_TIMEOUT`，默认 600s，超时杀整组返回 124）、多步确认执行器与终端交互件；
+- `lib/a-tools.sh` —— 工具域：工具注册表与执行管线（pre-execute 展示/风险/确认门 → execute 派发 → post-execute 截断/标记）及 10 个内置工具；
+- `lib/a-agent.sh` —— agent 循环域：turn/step 工具调用循环（请求 → tool_calls → 逐个执行 → 事件回填 → 再请求）、步数熔断、Ctrl-C 收尾。
 
 运行时把你的描述 + 当前系统/目录上下文发给模型（`temperature=0`，要求只返回命令），确认后 `eval` 执行。新增一种能力 = 在产品层加一个模式函数（自己的 prompt 与输出策略），复用 harness 的传输与上下文（`a ask` 即首个例子）。
 
@@ -197,7 +239,7 @@ dmesg | tail -50 | a                   # 有管道输入时，文字描述可以
 
 ```bash
 bash -n a.sh && zsh -n a.sh            # 语法检查（bash/zsh 双兼容）
-bash test.sh                            # 本地 mock API 全链路测试，不访问外网
+bash test.sh                            # 本地 mock API 全链路测试（176 项），不访问外网
 
-pwsh -NoProfile -File win/test.ps1      # Windows 版同源测试（win/ 见上节）
+pwsh -NoProfile -File win/test.ps1      # Windows 版同源测试（155 项；win/ 见上节）
 ```

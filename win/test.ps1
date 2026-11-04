@@ -47,7 +47,9 @@ import json, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1])
+AGENT_TMP = sys.argv[2] if len(sys.argv) > 2 else "."
 retry_state = {"count": 0}
+agent_state = {}
 
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -55,10 +57,98 @@ class H(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(n))
         msgs = body.get("messages", [])
         last_user = next((m["content"] for m in reversed(msgs) if m["role"] == "user"), "")
-        allc = " ".join(m["content"] for m in msgs)
+        allc = " ".join(m.get("content") or "" for m in msgs)
         auth = self.headers.get("Authorization", "")
         if "BADKEY" in auth or "AUTHFAIL" in last_user:
             code, obj = 401, {"error": {"message": "Authentication Fails (no such user)"}}
+        elif body.get("tools") is not None:
+            # ---- agent 模式: 非流式 + tool_calls（按标记词编排多步序列） ----
+            def tc(i, name, args):
+                return {"id": i, "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(args)}}
+            def seq(key, script):
+                st = agent_state.get(key, 0) + 1
+                agent_state[key] = st
+                return script[min(st - 1, len(script) - 1)]
+            msg = None
+            if "AGENTLOOPFOREVER" in last_user:
+                agent_state["LF"] = agent_state.get("LF", 0) + 1
+                msg = {"content": "", "tool_calls": [tc("cf_%d" % agent_state["LF"], "pwsh", {"command": "Write-Output FOREVER"})]}
+            elif "AGENTLOOP2" in last_user:
+                msg = seq("L2", [
+                    {"content": "", "tool_calls": [tc("c2_1", "pwsh", {"command": "Write-Output AGENT2_STEP1"})]},
+                    {"content": "AGENT2_DONE"},
+                ])
+            elif "AGENTSHOW" in last_user:
+                msg = seq("SH", [
+                    {"content": "", "tool_calls": [tc("cs_1", "pwsh", {"command": "Write-Output AGENT_SHOW_STEP"})]},
+                    {"content": "AGENT_SHOW_DONE"},
+                ])
+            elif "AGENTLOOP" in last_user:
+                msg = seq("L1", [
+                    {"content": "", "tool_calls": [tc("call_1", "pwsh", {"command": "Write-Output AGENT_STEP1"})]},
+                    {"content": "", "tool_calls": [tc("call_2", "pwsh", {"command": "Write-Output AGENT_STEP2"})]},
+                    {"content": "AGENT_DONE"},
+                ])
+            elif "AGENTDANGER" in last_user:
+                msg = seq("DG", [
+                    {"content": "", "tool_calls": [tc("call_d", "pwsh", {"command": "sudo rm -rf C:/a-agent-danger"})]},
+                    {"content": "DANGER_HANDLED"},
+                ])
+            elif "AGENTASK" in last_user:
+                msg = seq("AK", [
+                    {"content": "", "tool_calls": [tc("call_a", "ask_user_question",
+                        {"questions": [{"id": "q1", "question": "用哪个方案?",
+                                        "options": [{"label": "甲"}, {"label": "乙", "description": "保守"}]}]})]},
+                    {"content": "ASK_HANDLED" if '"answers"' in allc else "ASK_MISSING"},
+                ])
+            elif "AGENTTODO" in last_user:
+                msg = seq("TD", [
+                    {"content": "", "tool_calls": [tc("call_t", "todo_write",
+                        {"todos": [{"content": "第一步", "status": "completed"},
+                                   {"content": "第二步", "status": "in_progress"}]})]},
+                    {"content": "TODO_HANDLED" if "Updated todo list" in allc else "TODO_MISSING"},
+                ])
+            elif "AGENTWRITE" in last_user:
+                msg = seq("WY", [
+                    {"content": "", "tool_calls": [tc("call_w", "write",
+                        {"file_path": AGENT_TMP + "/a-agent-write-y.txt", "content": "written-by-agent"})]},
+                    {"content": "WRITE_HANDLED"},
+                ])
+            elif "AGENTDECLINE" in last_user:
+                msg = seq("WN", [
+                    {"content": "", "tool_calls": [tc("call_wn", "write",
+                        {"file_path": AGENT_TMP + "/a-agent-write-n.txt", "content": "should-not-exist"})]},
+                    {"content": "DECLINE_HANDLED" if "declined" in allc else "DECLINE_MISSING"},
+                ])
+            elif "AGENTCTX" in last_user:
+                msg = {"content": "CTX_SEEN" if "AGENT_DONE" in allc else "CTX_MISSING"}
+            elif "AGENTSHEMA" in last_user:
+                names = sorted(t["function"]["name"] for t in body["tools"])
+                ok = (len(names) == 10 and "pwsh" in names and body.get("tool_choice") == "auto" and body.get("stream") is False)
+                msg = {"content": "SCHEMA_OK" if ok else "SCHEMA_BAD:%s" % names}
+            elif "AGENTRETRY" in last_user:
+                st = agent_state.get("AR", 0) + 1
+                agent_state["AR"] = st
+                if st == 1:
+                    data = json.dumps({"error": {"message": "Insufficient Balance"}}).encode()
+                    self.send_response(429)
+                    self.send_header("retry-after", "1")
+                    self.send_header("content-type", "application/json")
+                    self.send_header("content-length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                msg = {"content": "RETRY_OK"}
+            else:
+                msg = {"content": "AGENT_DEFAULT"}
+            data = json.dumps({"choices": [{"message": msg, "finish_reason": "stop"}]}).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         else:
             nofence = False
             if "RATELIMIT" in last_user:
@@ -171,7 +261,9 @@ ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
 '@ | Set-Content -LiteralPath $mockPy -Encoding UTF8
 
 $mockPort = [int](& python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
-$mockProc = Start-Process python3 -ArgumentList "`"$mockPy`"", "$mockPort" -PassThru
+$agentTmp = Join-Path $TestTmp 'agent'
+New-Item -ItemType Directory -Path $agentTmp -Force | Out-Null
+$mockProc = Start-Process python3 -ArgumentList "`"$mockPy`"", "$mockPort", "`"$agentTmp`"" -PassThru
 Start-Sleep -Seconds 1
 $Url = "http://127.0.0.1:$mockPort"
 
@@ -541,6 +633,146 @@ Write-Output ok') '<# 说明
     $out = run_a '$null = a -y ''CDTEST 请求''; (Get-Location).Path'
     check '会话状态命令不受超时影响' (lastline $out) $tmpd
     Remove-Item env:A_TEST_DIR -ErrorAction SilentlyContinue
+    Remove-Item env:A_STEP_TIMEOUT -ErrorAction SilentlyContinue
+
+    Write-Host "== 5.5 工具域与事件日志单测（进程内） =="
+    $td = Join-Path $TestTmp 'tools'
+    New-Item -ItemType Directory -Path $td -Force | Out-Null
+    Push-Location $td
+    try {
+        $global:_A_AGENT_CWD = $td
+        'l1', 'l2', 'l3' | Set-Content -LiteralPath (Join-Path $td 'sample.txt')
+        Set-Content -LiteralPath (Join-Path $td 'other.log') 'other'
+
+        check '工具注册表登记 10 个工具' @($global:_A_TOOL_NAMES).Count 10
+        $sj = (_a_tools_schemas | ConvertTo-Json -Compress -Depth 8)
+        check_like 'tools schema 组包合法且含 pwsh' $sj '"name":"pwsh"'
+
+        check 'read 带行号与续读页脚' (_a_tool_dispatch 'read' '{"file_path":"sample.txt","limit":2}') `
+            "1: l1`n2: l2`n(Showing lines 1-2 of 3. Use offset=3 to continue.)"
+        check 'read 缺失文件报错' (_a_tool_dispatch 'read' '{"file_path":"no-such.txt"}') 'Error: file not found: no-such.txt'
+
+        check 'write 返回 OK' (_a_tool_dispatch 'write' '{"file_path":"sub/w.txt","content":"line1\nline2\n"}') 'OK: wrote sub/w.txt'
+        check 'write 内容精确(含尾部换行)' ([System.IO.File]::ReadAllText((Join-Path $td 'sub/w.txt'))) "line1`nline2`n"
+
+        check 'edit 唯一替换' (_a_tool_dispatch 'edit' '{"file_path":"sample.txt","old_string":"l2","new_string":"L2"}') 'OK: replaced 1 occurrence(s) in sample.txt'
+        check 'edit 结果落盘' ((Get-Content -LiteralPath (Join-Path $td 'sample.txt'))[1]) 'L2'
+        check_like 'edit 多处未开 replace_all 报错' (_a_tool_dispatch 'edit' '{"file_path":"sample.txt","old_string":"l","new_string":"x"}') 'old_string appears 2 times'
+        $null = _a_tool_dispatch 'edit' '{"file_path":"sample.txt","old_string":"l","new_string":"x","replace_all":true}'
+        check 'edit replace_all 全替换' ((Get-Content -LiteralPath (Join-Path $td 'sample.txt') -First 1)) 'x1'
+
+        check_like 'grep 命中带行号' (_a_tool_dispatch 'grep' '{"pattern":"L2"}') 'sample.txt:2:'
+        check 'grep 无命中提示' (_a_tool_dispatch 'grep' '{"pattern":"nomatchhere"}') '(no matches)'
+        check 'grep include 过滤' (_a_tool_dispatch 'grep' '{"pattern":"other","include":"*.log"}') ((Join-Path $td 'other.log') + ':1:other')
+
+        check 'glob 命中文件(mtime 优先)' (_a_tool_dispatch 'glob' '{"pattern":"sample*"}') (Join-Path $td 'sample.txt')
+
+        # macOS 上子进程 Get-Location 会把 /var 解析为 /private/var，用后缀匹配
+        check_like 'pwsh 在会话工作目录执行' (_a_tool_dispatch 'pwsh' '{"command":"(Get-Location).Path"}') "/tools`n[exit code: 0]"
+        $r = _a_tool_execute 1 'pwsh' '{"command":"exit 7"}'
+        check_like 'pwsh 退出码标记' $r '[exit code: 7]'
+        $r = _a_tool_execute 1 'pwsh' '{"command":"Write-Output (\"A\" * 6000)"}'
+        check_like 'pwsh 超长输出截尾(管线 post-execute)' $r 'output truncated, showing last 4000'
+
+        $env:A_STEP_TIMEOUT = '1'
+        $r = _a_tool_dispatch 'pwsh' '{"command":"Start-Sleep -Seconds 5"}'
+        check_like 'pwsh 超时标记与 124' $r 'timed out after 1 seconds'
+        check_like 'pwsh 超时退出码' $r '[exit code: 124]'
+        Remove-Item env:A_STEP_TIMEOUT -ErrorAction SilentlyContinue
+
+        check 'working_directory 切换(返回绝对路径)' (_a_tool_dispatch 'working_directory' '{"cd":"sub"}') "working directory set to: $(Join-Path $td 'sub')"
+
+        $r = _a_tool_dispatch 'todo_write' '{"todos":[{"content":"t1","status":"completed"},{"content":"t2","status":"in_progress"}]}' 6>$null
+        check 'todo 计数回执' $r 'Updated todo list: 0 pending, 1 in progress, 1 completed.'
+        $r = _a_tool_dispatch 'todo_write' '{"todos":[{"content":"a","status":"in_progress"},{"content":"b","status":"in_progress"}]}' 6>$null
+        check 'todo 多个 in_progress 报错' $r 'Error: at most one todo may be in_progress (got 2)'
+
+        $r = _a_tool_dispatch 'ask_user_question' '{"questions":[{"id":"q1","question":"选哪个?","options":[{"label":"A"},{"label":"B"}]}]}' 6>$null
+        if ([Console]::IsInputRedirected) {
+            check 'ask_user 无终端返回跳过语义' $r '{"answers":[{"id":"q1","selected":[],"custom":"(skipped: no terminal available)"}]}'
+        } else {
+            Write-Host '  （交互终端下跳过 ask_user 无终端分支）'
+        }
+
+        check '未知工具报错' (_a_tool_execute 1 'nosuch' '{}') 'Error: unknown tool: nosuch'
+
+        # 事件日志: append → derive 投影
+        _a_ev_clear t
+        _a_ev_append t 'U' '{"role":"user","content":"任务: A"}'
+        _a_ev_append t 'A' '{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"pwsh","arguments":"{}"}}]}'
+        _a_ev_append t 'T' '{"role":"tool","tool_call_id":"c1","content":"r1"}'
+        $m = _a_ev_derive t
+        check 'derive 投影消息形状(含 tool_calls 原样回放)' "$(@($m).Count) $($m[1].tool_calls[0].id) $($m[2].tool_call_id) $($m[2].content)" '3 c1 c1 r1'
+
+        $env:A_MAX_CONTEXT_CHARS = '120'
+        _a_ev_clear t
+        foreach ($i in 1..5) {
+            _a_ev_append t 'U' ('{"role":"user","content":"任务: U' + $i + ' PADPADPADPADPADPAD"}')
+            _a_ev_append t 'A' ('{"role":"assistant","content":"回答' + $i + ' PADPADPADPADPADPAD"}')
+        }
+        $m2 = _a_ev_derive t
+        check '超预算按完整轮裁剪' "$(@($m2).Count) $($m2[0].content.Split(' ')[1]) $($m2[-1].content.Split(' ')[0])" '2 U5 回答5'
+        Remove-Item env:A_MAX_CONTEXT_CHARS -ErrorAction SilentlyContinue
+    } finally {
+        Pop-Location
+    }
+
+    # 管线拒绝路径(子进程 stdin 重定向 → 无终端分支)
+    $declPath = (Join-Path $td 'declined.txt') -replace '\\', '/'
+    $r = run_a_stdin ("_a_tool_execute 0 'write' '{`"file_path`":`"$declPath`",`"content`":`"x`"}'")
+    check '无终端时写文件被拒并回传文本' (lastline $r.Out) '[user declined this tool call]'
+    if (Test-Path (Join-Path $td 'declined.txt')) { fail '被拒调用未落盘' } else { ok '被拒调用未落盘' }
+
+    Write-Host "== 5.6 agent 模式全链路（mock） =="
+    $env:A_STEP_TIMEOUT = '30'
+    $r = run_a_stdin "a agent 'AGENTLOOP 测试'"
+    check 'agent 多步工具循环到最终回答' "$($r.Rc) - $(lastline $r.Out)" '0 - AGENT_DONE'
+    check_like 'agent 工具输出实时展示' $r.Out 'AGENT_STEP1'
+
+    $r = run_a_stdin "a agent 'AGENTSHEMA 校验'"
+    check '请求携带 10 工具(含 pwsh)/tool_choice=auto/非流式' "$($r.Rc) - $(lastline $r.Out)" '0 - SCHEMA_OK'
+
+    $out = run_a "a agent 'AGENTLOOP 测试' | Out-Null; a agent 'AGENTCTX 续聊'"
+    check 'agent 会话多轮续接（事件日志携带上轮）' (lastline $out) 'CTX_SEEN'
+
+    $out = run_a "a agent 'AGENTCTX 测试' | Out-Null; a --show"
+    check_like '--show 渲染 agent 事件视图' $out '[agent]'
+    check_like '--show 展示 agent 轮次' $out '轮 1'
+
+    $out = run_a "a agent 'AGENTLOOP 测试' | Out-Null; a -c; a agent 'AGENTCTX 测试'"
+    check 'a -c 清空 agent 事件日志' (lastline $out) 'CTX_MISSING'
+
+    $r = run_a_stdin "a agent 'AGENTDANGER 测试'"
+    check '无终端时高危工具调用被拒且循环继续' "$($r.Rc) - $(lastline $r.Out)" '0 - DANGER_HANDLED'
+    check_like '拒绝提示展示' $r.Out '已拒绝本次工具调用'
+
+    $r = run_a_stdin "a agent 'AGENTASK 测试'"
+    check 'ask_user 无终端跳过后循环继续' "$($r.Rc) - $(lastline $r.Out)" '0 - ASK_HANDLED'
+
+    $r = run_a_stdin "a agent 'AGENTTODO 测试'"
+    check 'todo_write 全链路' "$($r.Rc) - $(lastline $r.Out)" '0 - TODO_HANDLED'
+    check_like 'todo 清单渲染' $r.Out '任务清单'
+
+    $wy = Join-Path $agentTmp 'a-agent-write-y.txt'
+    $wn = Join-Path $agentTmp 'a-agent-write-n.txt'
+    Remove-Item $wy, $wn -ErrorAction SilentlyContinue
+    $r = run_a_stdin "a -y agent 'AGENTWRITE 测试'"
+    check '-y 写文件自动放行并完成' "$($r.Rc) - $(lastline $r.Out) - $([System.IO.File]::ReadAllText($wy))" '0 - WRITE_HANDLED - written-by-agent'
+
+    $r = run_a_stdin "a agent 'AGENTDECLINE 测试'"
+    check '无终端写文件被拒、拒因回传模型' "$($r.Rc) - $(lastline $r.Out)" '0 - DECLINE_HANDLED'
+    if (Test-Path $wn) { fail '被拒写调用未落盘' } else { ok '被拒写调用未落盘' }
+
+    $env:A_AGENT_MAX_STEPS = '2'
+    $r = run_a_stdin "a agent 'AGENTLOOPFOREVER 测试'"
+    check '步数上限熔断' "$($r.Rc) - $(@($r.Out -split "`n" | Where-Object { $_ -match '步数上限' }).Count)" '1 - 1'
+    Remove-Item env:A_AGENT_MAX_STEPS -ErrorAction SilentlyContinue
+
+    $r = run_a_stdin "a agent 'AGENTRETRY 测试'"
+    check 'agent 请求 429 自动重试(整包模式)' "$($r.Rc) - $(lastline $r.Out)" '0 - RETRY_OK'
+
+    $rc = run_a_rc "a -p agent '某任务'"
+    check 'agent 不支持 -p' $rc 2
     Remove-Item env:A_STEP_TIMEOUT -ErrorAction SilentlyContinue
 
     Write-Host "== 6. setup 工具函数与配置合并 =="

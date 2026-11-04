@@ -61,11 +61,70 @@ _a_conv_trim() {
     '
 }
 
-# 查看会话的上下文构成（每个有内容的模式一段）
+# ---------- 事件日志（agent 模式，对齐 dsh 会话事件 + deriveMessages） ----------
+# 每行一条: 事件类型<TAB>消息JSON。消息 JSON 直接采用 OpenAI 消息格式——
+# U=user/message  A=assistant/message(含 tool_calls 原样回放)  T=tool/result。
+# 投影(裁剪+拼接)即得 messages 数组，避免二次组装走样(id/参数分毫不差)。
+# 不设条数上限: 裁剪必须以完整轮(U 行开新轮)为界——半轮会留下没有 tool 结果的
+# assistant 消息，OpenAI 接口直接 400。工具结果文本在落日志前由调用方截断。
+
+_a_ev_name() {
+    local m=${1:-agent}
+    printf '_A_EV_%s' "${m//[^a-zA-Z0-9_]/_}"
+}
+
+_a_ev_get() {
+    eval "printf '%s' \"\${$(_a_ev_name "$1"):-}\""
+}
+_a_ev_set() {
+    eval "$(_a_ev_name "$1")=\$2"
+}
+_a_ev_clear() {
+    eval "unset $(_a_ev_name "$1")" 2>/dev/null || true
+}
+
+_a_ev_append() { # _a_ev_append <mode> <类型U|A|T> <消息JSON>
+    local mode=$1 ev
+    ev=$(_a_ev_get "$mode")
+    if [[ -n $ev ]]; then
+        ev="$ev
+$2"$'\t'"$3"
+    else
+        ev="$2"$'\t'"$3"
+    fi
+    _a_ev_set "$mode" "$ev"
+}
+
+# 按字符预算从新到旧保留完整的轮(U 行开新轮)，与 _a_conv_trim 同法;
+# 至少保留最新一轮。预算由 A_MAX_CONTEXT_CHARS 控制
+_a_ev_trim() {
+    awk -v budget="${A_MAX_CONTEXT_CHARS:-24000}" '
+        { types[NR] = substr($0, 1, 1); lens[NR] = length($0) + 1; lines[NR] = $0 }
+        END {
+            n = NR; total = 0; start = n + 1
+            for (i = n; i >= 1; i--) {
+                if (types[i] != "U") continue
+                rl = 0
+                for (j = i; j < start; j++) rl += lens[j]
+                if (total + rl > budget && start <= n) break
+                total += rl; start = i
+            }
+            for (i = start; i <= n; i++) print lines[i]
+        }'
+}
+
+# deriveMessages 投影: 事件日志 → messages 数组(逗号连接，不含 system;可为空)
+_a_ev_derive() { # _a_ev_derive <mode>
+    local ev=$(_a_ev_get "$1")
+    [[ -n $ev ]] || return 0
+    printf '%s\n' "$ev" | _a_ev_trim | cut -f2- | paste -sd, -
+}
+
+# 查看会话的上下文构成（每个有内容的模式一段;agent 模式渲染事件日志视图）
 _a_show() { # _a_show <mode...>
     local m conv any=0
     for m in "$@"; do
-        [[ -n $(_a_conv_get "$m") ]] && any=1
+        [[ -n $(_a_conv_get "$m") || -n $(_a_ev_get "$m") ]] && any=1
     done
     if [[ $any == 0 ]]; then
         printf '（当前会话暂无对话上下文）\n'
@@ -73,9 +132,43 @@ _a_show() { # _a_show <mode...>
     fi
     local budget=${A_MAX_CONTEXT_CHARS:-24000}
     local total all_n kept_n kept_chars round c
+    local ev
     for m in "$@"; do
+        ev=$(_a_ev_get "$m")
         conv=$(_a_conv_get "$m")
-        [[ -n $conv ]] || continue
+        [[ -n $ev || -n $conv ]] || continue
+        if [[ -n $ev ]]; then
+            # agent 模式: 事件日志视图
+            total=$(printf '%s' "$ev" | wc -c | tr -d ' ')
+            all_n=$(printf '%s\n' "$ev" | wc -l | tr -d ' ')
+            local kept
+            kept=$(printf '%s\n' "$ev" | _a_ev_trim)
+            kept_n=$(printf '%s\n' "$kept" | wc -l | tr -d ' ')
+            kept_chars=$(printf '%s' "$kept" | wc -c | tr -d ' ')
+            printf '[%s] 会话事件: %d 条 / %d 字节，预算 %d，下一轮将发送 %d 条 / %d 字节（a -c 清空）\n' \
+                "$m" "$all_n" "$total" "$budget" "$kept_n" "$kept_chars"
+            round=0
+            printf '%s\n' "$kept" | while IFS=$'\t' read -r typ json; do
+                c=$(printf '%s' "$json" | _a_msg_content 2>/dev/null)
+                case $typ in
+                    U)
+                        round=$((round + 1))
+                        printf '  轮 %d  %s\n' "$round" "$(printf '%s\n' "$c" | tail -n 1 | sed 's/^请求: //' | cut -c 1-70)"
+                        ;;
+                    A)
+                        if [[ -n $c ]]; then
+                            printf '        回答: %s\n' "$(printf '%s\n' "$c" | head -n 1 | cut -c 1-70)"
+                        else
+                            printf '        ⚙ 调用工具\n'
+                        fi
+                        ;;
+                    T)
+                        printf '        ↳ %s\n' "$(printf '%s\n' "$c" | head -n 1 | cut -c 1-70)"
+                        ;;
+                esac
+            done
+            continue
+        fi
         total=$(printf '%s' "$conv" | wc -c | tr -d ' ')
         all_n=$(printf '%s\n' "$conv" | wc -l | tr -d ' ')
         kept=$(printf '%s\n' "$conv" | _a_conv_trim)

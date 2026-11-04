@@ -72,10 +72,77 @@ function _a_conv_trim([string]$Conv) {
     return @($lines[$start..($n - 1)])
 }
 
-# 查看会话的上下文构成（每个有内容的模式一段）
+# ---------- 事件日志（agent 模式，对齐 dsh 会话事件 + deriveMessages） ----------
+# 每行一条: 事件类型<TAB>消息JSON。消息 JSON 直接采用 OpenAI 消息格式——
+# U=user/message  A=assistant/message(含 tool_calls 原样回放)  T=tool/result。
+# 投影(裁剪+解析)即得消息对象数组。不设条数上限: 裁剪必须以完整轮(U 行开新轮)
+# 为界——半轮会留下没有 tool 结果的 assistant 消息，OpenAI 接口直接 400。
+# 工具结果文本在落日志前由调用方截断。
+
+$global:_A_EV = @{}
+
+function _a_ev_get([string]$Mode) {
+    $k = _a_conv_name $Mode
+    if ($global:_A_EV.ContainsKey($k)) { return $global:_A_EV[$k] }
+    return ''
+}
+function _a_ev_set([string]$Mode, [string]$Value) {
+    $global:_A_EV[(_a_conv_name $Mode)] = $Value
+}
+function _a_ev_clear([string]$Mode) {
+    $global:_A_EV.Remove((_a_conv_name $Mode))
+}
+
+function _a_ev_append([string]$Mode, [string]$Type, [string]$MsgJson) {
+    $ev = _a_ev_get $Mode
+    if ($ev) { _a_ev_set $Mode ($ev + "`n" + $Type + "`t" + $MsgJson) }
+    else { _a_ev_set $Mode ($Type + "`t" + $MsgJson) }
+}
+
+# 按字符预算从新到旧保留完整的轮(U 行开新轮)，与 _a_conv_trim 同法;至少保留最新一轮
+function _a_ev_trim([string]$Ev) {
+    $budget = 24000
+    if ($env:A_MAX_CONTEXT_CHARS) { $budget = [int]$env:A_MAX_CONTEXT_CHARS }
+    if (-not $Ev) { return @() }
+    $lines = @($Ev -split "`n")
+    $n = $lines.Count
+    $types = @(); $lens = @()
+    for ($i = 0; $i -lt $n; $i++) {
+        $types += $lines[$i].Substring(0, 1)
+        $lens += $lines[$i].Length + 1
+    }
+    $total = 0; $start = $n
+    for ($i = $n - 1; $i -ge 0; $i--) {
+        if ($types[$i] -ne 'U') { continue }
+        $rl = 0
+        for ($j = $i; $j -lt $start; $j++) { $rl += $lens[$j] }
+        if ($total + $rl -gt $budget -and $start -lt $n) { break }
+        $total += $rl; $start = $i
+    }
+    if ($start -ge $n) { return @() }
+    return @($lines[$start..($n - 1)])
+}
+
+# deriveMessages 投影: 事件日志 → 消息对象数组（不含 system;可为空数组）
+function _a_ev_derive([string]$Mode) {
+    $ev = _a_ev_get $Mode
+    if (-not $ev) { return @() }
+    $msgs = @()
+    foreach ($line in (_a_ev_trim $ev)) {
+        $idx = $line.IndexOf("`t")
+        if ($idx -lt 1) { continue }
+        $msgs += (ConvertFrom-Json -InputObject $line.Substring($idx + 1))
+    }
+    return , @($msgs)
+}
+
+# 查看会话的上下文构成（每个有内容的模式一段;agent 模式渲染事件日志视图）
 function _a_show([string[]]$Modes) {
+    # 注意: 条件里的函数调用必须加括号——参数位置的 -or 会被当成字符串实参传给函数
     $any = $false
-    foreach ($m in $Modes) { if (_a_conv_get $m) { $any = $true } }
+    foreach ($m in $Modes) {
+        if ((_a_conv_get $m) -or (_a_ev_get $m)) { $any = $true }
+    }
     if (-not $any) {
         Write-Output '（当前会话暂无对话上下文）'
         return
@@ -83,8 +150,50 @@ function _a_show([string[]]$Modes) {
     $budget = 24000
     if ($env:A_MAX_CONTEXT_CHARS) { $budget = [int]$env:A_MAX_CONTEXT_CHARS }
     foreach ($m in $Modes) {
+        $ev = _a_ev_get $m
         $conv = _a_conv_get $m
-        if (-not $conv) { continue }
+        if (-not $ev -and -not $conv) { continue }
+        if ($ev) {
+            # agent 模式: 事件日志视图
+            $allN = @($ev -split "`n").Count
+            $kept = _a_ev_trim $ev
+            $keptN = $kept.Count
+            $keptChars = ($kept -join "`n").Length
+            Write-Output ('[{0}] 会话事件: {1} 条 / {2} 字符，预算 {3}，下一轮将发送 {4} 条 / {5} 字符（a -c 清空）' -f `
+                $m, $allN, $ev.Length, $budget, $keptN, $keptChars)
+            $round = 0
+            foreach ($line in $kept) {
+                $idx = $line.IndexOf("`t")
+                if ($idx -lt 1) { continue }
+                $typ = $line.Substring(0, $idx)
+                $c = _a_msg_content $line.Substring($idx + 1)
+                $clines = @($c -split "`n")
+                switch ($typ) {
+                    'U' {
+                        $round++
+                        $tail = $clines[$clines.Count - 1]
+                        if ($tail.StartsWith('任务: ')) { $tail = $tail.Substring(4) }
+                        if ($tail.Length -gt 70) { $tail = $tail.Substring(0, 70) }
+                        Write-Output ('  轮 {0}  {1}' -f $round, $tail)
+                    }
+                    'A' {
+                        if ($c.Trim() -ne '') {
+                            $head = $clines[0]
+                            if ($head.Length -gt 70) { $head = $head.Substring(0, 70) }
+                            Write-Output ('        回答: {0}' -f $head)
+                        } else {
+                            Write-Output '        ⚙ 调用工具'
+                        }
+                    }
+                    'T' {
+                        $head = $clines[0]
+                        if ($head.Length -gt 70) { $head = $head.Substring(0, 70) }
+                        Write-Output ('        ↳ {0}' -f $head)
+                    }
+                }
+            }
+            continue
+        }
         $allN = @($conv -split "`n").Count
         $total = $conv.Length
         $kept = _a_conv_trim $conv
