@@ -25,7 +25,7 @@
 #   lib/a-agent.sh agent 循环域（turn/step 工具调用循环）
 # 仓库需整体携带（a.sh 与 lib/ 同级），rc 只需 source 本文件。
 
-A_VERSION="0.5.0"
+A_VERSION="0.6.0"
 
 # ---------- 加载 harness ----------
 # 定位本文件所在目录（兼容 bash/zsh、相对路径与异地 cwd），lib 随仓库走。

@@ -28,7 +28,7 @@
 # 与 bash 版的差异: PowerShell 函数没有独立退出码，a 的执行结果码在 $A_LAST_RC；
 # 管道不派生子 shell，cd 与 $env: 赋值天然在当前会话生效。
 
-$global:A_VERSION = '0.5.0'
+$global:A_VERSION = '0.6.0'
 
 # ---------- 加载 harness ----------
 # 定位本文件所在目录（$PSScriptRoot 兼容任意 cwd 与相对路径 dot-source），lib 随仓库走。

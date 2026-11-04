@@ -793,9 +793,9 @@ Write-Output ok') '<# 说明
 
     Write-Host "== 7. harness 拆分加载 =="
     $out = run_a "Set-Location '$TestTmp'; . '$RepoDir/a.ps1'; a --version"
-    check '异地 cwd 绝对路径加载' (lastline $out) 'agent-cli-bash 0.5.0'
+    check '异地 cwd 绝对路径加载' (lastline $out) 'agent-cli-bash 0.6.0'
     $out = & pwsh -NoProfile -Command "Set-Location '$RepoDir'; . ./a.ps1; a --version" 2>&1
-    check '相对路径 dot-source 加载' (lastline $out) 'agent-cli-bash 0.5.0'
+    check '相对路径 dot-source 加载' (lastline $out) 'agent-cli-bash 0.6.0'
 
     Write-Host "== 8. install.ps1 安装/卸载 =="
     $tmpHome = Join-Path $TestTmp 'home'
